@@ -30,6 +30,7 @@
 
 import org.opensearch.gradle.Architecture
 import org.opensearch.gradle.VersionProperties
+import org.opensearch.gradle.info.BuildParams
 import org.opensearch.gradle.test.TestTask
 
 apply plugin: 'war'
@@ -40,7 +41,7 @@ apply plugin: 'opensearch.internal-distribution-download'
 testFixtures.useFixture()
 
 dependencies {
-  providedCompile('jakarta.enterprise:jakarta.enterprise.cdi-api:4.0.1') {
+  providedCompile('jakarta.enterprise:jakarta.enterprise.cdi-api:4.1.0') {
     exclude module: 'jakarta.annotation-api'
   }
   providedCompile 'jakarta.ws.rs:jakarta.ws.rs-api:3.1.0'
@@ -84,8 +85,16 @@ preProcessFixture {
   dependsOn war, opensearch_distributions.docker
 }
 
+tasks.named('spotlessJava').configure {
+  mustRunAfter preProcessFixture
+}
+
 dockerCompose {
-  useComposeFiles = ['docker-compose.yml']
+  def composeFiles = ['docker-compose.yml']
+  if (BuildParams.isInFipsJvm()) {
+    composeFiles.add('docker-compose.fips.yml')
+  }
+  useComposeFiles = composeFiles
 }
 
 tasks.register("integTest", TestTask) {

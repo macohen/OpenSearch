@@ -47,7 +47,6 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.action.ActionFuture;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.PointInTimeBuilder;
@@ -83,11 +82,6 @@ public class SearchAfterIT extends ParameterizedStaticSettingsOpenSearchIntegTes
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     public void testsShouldFail() throws Exception {
@@ -250,7 +244,7 @@ public class SearchAfterIT extends ParameterizedStaticSettingsOpenSearchIntegTes
             .setQuery(matchAllQuery())
             .searchAfter(new Object[] { 0, null })
             .get();
-        assertThat(searchResponse.getHits().getTotalHits().value, Matchers.equalTo(2L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), Matchers.equalTo(2L));
         assertThat(searchResponse.getHits().getHits().length, Matchers.equalTo(1));
         assertThat(searchResponse.getHits().getHits()[0].getSourceAsMap().get("field1"), Matchers.equalTo(100));
         assertThat(searchResponse.getHits().getHits()[0].getSourceAsMap().get("field2"), Matchers.equalTo("toto"));

@@ -76,6 +76,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 
@@ -289,8 +290,7 @@ public class QueryPhase {
                 );
 
                 ExecutorService executor = searchContext.indexShard().getThreadPool().executor(ThreadPool.Names.SEARCH);
-                if (executor instanceof EWMATrackingThreadPoolExecutor) {
-                    final EWMATrackingThreadPoolExecutor rExecutor = (EWMATrackingThreadPoolExecutor) executor;
+                if (executor instanceof EWMATrackingThreadPoolExecutor rExecutor) {
                     queryResult.nodeQueueSize(rExecutor.getCurrentQueueSize());
                     queryResult.serviceTimeEWMA((long) rExecutor.getTaskExecutionEWMA());
                 }
@@ -335,13 +335,12 @@ public class QueryPhase {
         ContextIndexSearcher searcher,
         Query query,
         LinkedList<QueryCollectorContext> collectors,
+        QueryCollectorContext queryCollectorContext,
         boolean hasFilterCollector,
         boolean timeoutSet
     ) throws IOException {
-        // create the top docs collector last when the other collectors are known
-        final TopDocsCollectorContext topDocsFactory = createTopDocsCollectorContext(searchContext, hasFilterCollector);
-        // add the top docs collector, the first collector context in the chain
-        collectors.addFirst(topDocsFactory);
+        // add passed collector, the first collector context in the chain
+        collectors.addFirst(Objects.requireNonNull(queryCollectorContext));
 
         final Collector queryCollector;
         if (searchContext.getProfilers() != null) {
@@ -355,6 +354,9 @@ public class QueryPhase {
         try {
             searcher.search(query, queryCollector);
         } catch (EarlyTerminatingCollector.EarlyTerminationException e) {
+            // EarlyTerminationException is not caught in ContextIndexSearcher to allow force termination of collection. Postcollection
+            // still needs to be processed for Aggregations when early termination takes place.
+            searchContext.bucketCollectorProcessor().processPostCollection(queryCollector);
             queryResult.terminatedEarly(true);
         }
         if (searchContext.isSearchTimedOut()) {
@@ -370,7 +372,10 @@ public class QueryPhase {
         for (QueryCollectorContext ctx : collectors) {
             ctx.postProcess(queryResult);
         }
-        return topDocsFactory.shouldRescore();
+        if (queryCollectorContext instanceof RescoringQueryCollectorContext rescoringContext) {
+            return rescoringContext.shouldRescore();
+        }
+        return false;
     }
 
     /**
@@ -383,7 +388,7 @@ public class QueryPhase {
         }
         final Sort sort = sortAndFormats.sort;
         for (LeafReaderContext ctx : reader.leaves()) {
-            Sort indexSort = ctx.reader().getMetaData().getSort();
+            Sort indexSort = ctx.reader().getMetaData().sort();
             if (indexSort == null || Lucene.canEarlyTerminate(sort, indexSort) == false) {
                 return false;
             }
@@ -440,7 +445,59 @@ public class QueryPhase {
             boolean hasFilterCollector,
             boolean hasTimeout
         ) throws IOException {
-            return QueryPhase.searchWithCollector(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
+            QueryCollectorContext queryCollectorContext = getQueryCollectorContext(searchContext, query, hasFilterCollector);
+            return searchWithCollector(searchContext, searcher, query, collectors, queryCollectorContext, hasFilterCollector, hasTimeout);
+        }
+
+        private QueryCollectorContext getQueryCollectorContext(SearchContext searchContext, Query query, boolean hasFilterCollector)
+            throws IOException {
+            // create the top docs collector last when the other collectors are known
+            final Optional<QueryCollectorContext> queryCollectorContextOpt = QueryCollectorContextSpecRegistry.getQueryCollectorContextSpec(
+                searchContext,
+                query,
+                new QueryCollectorArguments.Builder().hasFilterCollector(hasFilterCollector).build()
+            ).map(queryCollectorContextSpec -> new QueryCollectorContext(queryCollectorContextSpec.getContextName()) {
+                @Override
+                Collector create(Collector in) throws IOException {
+                    return queryCollectorContextSpec.create(in);
+                }
+
+                @Override
+                CollectorManager<?, ReduceableSearchResult> createManager(CollectorManager<?, ReduceableSearchResult> in)
+                    throws IOException {
+                    return queryCollectorContextSpec.createManager(in);
+                }
+
+                @Override
+                void postProcess(QuerySearchResult result) throws IOException {
+                    queryCollectorContextSpec.postProcess(result);
+                }
+            });
+            if (queryCollectorContextOpt.isPresent()) {
+                return queryCollectorContextOpt.get();
+            } else {
+                return createTopDocsCollectorContext(searchContext, hasFilterCollector);
+            }
+        }
+
+        protected boolean searchWithCollector(
+            SearchContext searchContext,
+            ContextIndexSearcher searcher,
+            Query query,
+            LinkedList<QueryCollectorContext> collectors,
+            QueryCollectorContext queryCollectorContext,
+            boolean hasFilterCollector,
+            boolean hasTimeout
+        ) throws IOException {
+            return QueryPhase.searchWithCollector(
+                searchContext,
+                searcher,
+                query,
+                collectors,
+                queryCollectorContext,
+                hasFilterCollector,
+                hasTimeout
+            );
         }
     }
 }

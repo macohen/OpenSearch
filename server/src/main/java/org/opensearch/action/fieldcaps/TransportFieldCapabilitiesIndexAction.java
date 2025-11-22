@@ -41,10 +41,12 @@ import org.opensearch.action.NoShardAvailableActionException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.ChannelActionListener;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.action.support.TransportIndicesResolvingAction;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.FailAwareWeightedRouting;
@@ -93,7 +95,7 @@ import static org.opensearch.action.support.TransportActions.isShardNotAvailable
  */
 public class TransportFieldCapabilitiesIndexAction extends HandledTransportAction<
     FieldCapabilitiesIndexRequest,
-    FieldCapabilitiesIndexResponse> {
+    FieldCapabilitiesIndexResponse> implements TransportIndicesResolvingAction<FieldCapabilitiesIndexRequest> {
 
     private static final Logger logger = LogManager.getLogger(TransportFieldCapabilitiesIndexAction.class);
 
@@ -213,6 +215,11 @@ public class TransportFieldCapabilitiesIndexAction extends HandledTransportActio
         return state.blocks().indexBlockedException(ClusterBlockLevel.READ, concreteIndex);
     }
 
+    @Override
+    public ResolvedIndices resolveIndices(FieldCapabilitiesIndexRequest request) {
+        return ResolvedIndices.of(request.index());
+    }
+
     /**
      * An action that executes on each shard sequentially until it finds one that can match the provided
      * {@link FieldCapabilitiesIndexRequest#indexFilter()}. In which case the shard is used
@@ -247,8 +254,7 @@ public class TransportFieldCapabilitiesIndexAction extends HandledTransportActio
                 throw blockException;
             }
 
-            shardsIt = clusterService.operationRouting()
-                .searchShards(clusterService.state(), new String[] { request.index() }, null, null, null, null);
+            shardsIt = clusterService.operationRouting().searchShards(clusterService.state(), new String[] { request.index() }, null, null);
         }
 
         public void start() {

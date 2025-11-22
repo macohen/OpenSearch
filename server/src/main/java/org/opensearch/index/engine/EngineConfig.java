@@ -33,6 +33,7 @@ package org.opensearch.index.engine;
 
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.MergePolicy;
 import org.apache.lucene.search.QueryCache;
@@ -40,6 +41,7 @@ import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.similarities.Similarity;
+import org.opensearch.cluster.service.ClusterApplierService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.settings.Setting;
@@ -53,7 +55,9 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.codec.CodecAliases;
 import org.opensearch.index.codec.CodecService;
 import org.opensearch.index.codec.CodecSettings;
+import org.opensearch.index.mapper.DocumentMapperForType;
 import org.opensearch.index.mapper.ParsedDocument;
+import org.opensearch.index.merge.MergedSegmentTransferTracker;
 import org.opensearch.index.seqno.RetentionLeases;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.InternalTranslogFactory;
@@ -110,6 +114,9 @@ public final class EngineConfig {
     private final boolean isReadOnlyReplica;
     private final BooleanSupplier startedPrimarySupplier;
     private final Comparator<LeafReader> leafSorter;
+    private final Supplier<DocumentMapperForType> documentMapperForTypeSupplier;
+    private final ClusterApplierService clusterApplierService;
+    private final MergedSegmentTransferTracker mergedSegmentTransferTracker;
 
     /**
      * A supplier of the outstanding retention leases. This is used during merged operations to determine which operations that have been
@@ -145,8 +152,7 @@ public final class EngineConfig {
 
                 for (String codecName : Codec.availableCodecs()) {
                     Codec codec = Codec.forName(codecName);
-                    if (codec instanceof CodecAliases) {
-                        CodecAliases codecWithAlias = (CodecAliases) codec;
+                    if (codec instanceof CodecAliases codecWithAlias) {
                         if (codecWithAlias.aliases().contains(s)) {
                             return s;
                         }
@@ -201,18 +207,17 @@ public final class EngineConfig {
             default:
                 if (Codec.availableCodecs().contains(codec)) {
                     Codec luceneCodec = Codec.forName(codec);
-                    if (luceneCodec instanceof CodecSettings
-                        && ((CodecSettings) luceneCodec).supports(INDEX_CODEC_COMPRESSION_LEVEL_SETTING)) {
+                    if (luceneCodec instanceof CodecSettings codecSettings
+                        && codecSettings.supports(INDEX_CODEC_COMPRESSION_LEVEL_SETTING)) {
                         return;
                     }
                 }
                 for (String codecName : Codec.availableCodecs()) {
                     Codec availableCodec = Codec.forName(codecName);
-                    if (availableCodec instanceof CodecAliases) {
-                        CodecAliases availableCodecWithAlias = (CodecAliases) availableCodec;
+                    if (availableCodec instanceof CodecAliases availableCodecWithAlias) {
                         if (availableCodecWithAlias.aliases().contains(codec)) {
-                            if (availableCodec instanceof CodecSettings
-                                && ((CodecSettings) availableCodec).supports(INDEX_CODEC_COMPRESSION_LEVEL_SETTING)) {
+                            if (availableCodec instanceof CodecSettings codecSettings
+                                && codecSettings.supports(INDEX_CODEC_COMPRESSION_LEVEL_SETTING)) {
                                 return;
                             }
                         }
@@ -236,15 +241,23 @@ public final class EngineConfig {
         Property.Dynamic
     );
 
+    public static final Setting<Boolean> INDEX_USE_COMPOUND_FILE = Setting.boolSetting(
+        "index.use_compound_file",
+        true,
+        Property.IndexScope
+    );
+
     private final TranslogConfig translogConfig;
 
     private final TranslogFactory translogFactory;
+
+    private final IndexWriter.IndexReaderWarmer indexReaderWarmer;
 
     /**
      * Creates a new {@link org.opensearch.index.engine.EngineConfig}
      */
     private EngineConfig(Builder builder) {
-        if (builder.isReadOnlyReplica && builder.indexSettings.isSegRepEnabled() == false) {
+        if (builder.isReadOnlyReplica && builder.indexSettings.isSegRepEnabledOrRemoteNode() == false) {
             throw new IllegalArgumentException("Shard can only be wired as a read only replica with Segment Replication enabled");
         }
         this.shardId = builder.shardId;
@@ -290,6 +303,10 @@ public final class EngineConfig {
         this.startedPrimarySupplier = builder.startedPrimarySupplier;
         this.translogFactory = builder.translogFactory;
         this.leafSorter = builder.leafSorter;
+        this.documentMapperForTypeSupplier = builder.documentMapperForTypeSupplier;
+        this.indexReaderWarmer = builder.indexReaderWarmer;
+        this.clusterApplierService = builder.clusterApplierService;
+        this.mergedSegmentTransferTracker = builder.mergedSegmentTransferTracker;
     }
 
     /**
@@ -299,6 +316,45 @@ public final class EngineConfig {
      */
     public void setEnableGcDeletes(boolean enableGcDeletes) {
         this.enableGcDeletes = enableGcDeletes;
+    }
+
+    /**
+     * Creates a new Builder pre-populated with all values from this EngineConfig.
+     * This allows for easy modification of specific fields while preserving all others.
+     *
+     * @return a new Builder instance with all current configuration values
+     */
+    public Builder toBuilder() {
+        return new Builder().shardId(this.shardId)
+            .threadPool(this.threadPool)
+            .indexSettings(this.indexSettings)
+            .warmer(this.warmer)
+            .store(this.store)
+            .mergePolicy(this.mergePolicy)
+            .analyzer(this.analyzer)
+            .similarity(this.similarity)
+            .codecService(this.codecService)
+            .eventListener(this.eventListener)
+            .queryCache(this.queryCache)
+            .queryCachingPolicy(this.queryCachingPolicy)
+            .translogConfig(this.translogConfig)
+            .translogDeletionPolicyFactory(this.translogDeletionPolicyFactory)
+            .flushMergesAfter(this.flushMergesAfter)
+            .externalRefreshListener(this.externalRefreshListener)
+            .internalRefreshListener(this.internalRefreshListener)
+            .indexSort(this.indexSort)
+            .circuitBreakerService(this.circuitBreakerService)
+            .globalCheckpointSupplier(this.globalCheckpointSupplier)
+            .retentionLeasesSupplier(this.retentionLeasesSupplier)
+            .primaryTermSupplier(this.primaryTermSupplier)
+            .tombstoneDocSupplier(this.tombstoneDocSupplier)
+            .readOnlyReplica(this.isReadOnlyReplica)
+            .startedPrimarySupplier(this.startedPrimarySupplier)
+            .translogFactory(this.translogFactory)
+            .leafSorter(this.leafSorter)
+            .documentMapperForTypeSupplier(this.documentMapperForTypeSupplier)
+            .indexReaderWarmer(this.indexReaderWarmer)
+            .clusterApplierService(this.clusterApplierService);
     }
 
     /**
@@ -491,7 +547,11 @@ public final class EngineConfig {
      * @return true if this engine should be wired as read only.
      */
     public boolean isReadOnlyReplica() {
-        return indexSettings.isSegRepEnabled() && isReadOnlyReplica;
+        return indexSettings.isSegRepEnabledOrRemoteNode() && isReadOnlyReplica;
+    }
+
+    public boolean useCompoundFile() {
+        return indexSettings.getValue(INDEX_USE_COMPOUND_FILE);
     }
 
     /**
@@ -508,6 +568,14 @@ public final class EngineConfig {
      */
     public TranslogFactory getTranslogFactory() {
         return translogFactory;
+    }
+
+    /**
+     * Returns the underlying indexReaderWarmer
+     * @return the indexReaderWarmer
+     */
+    public IndexWriter.IndexReaderWarmer getIndexReaderWarmer() {
+        return indexReaderWarmer;
     }
 
     /**
@@ -534,6 +602,10 @@ public final class EngineConfig {
         return tombstoneDocSupplier;
     }
 
+    public Supplier<DocumentMapperForType> getDocumentMapperForTypeSupplier() {
+        return documentMapperForTypeSupplier;
+    }
+
     public TranslogDeletionPolicyFactory getCustomTranslogDeletionPolicyFactory() {
         return translogDeletionPolicyFactory;
     }
@@ -548,10 +620,25 @@ public final class EngineConfig {
     }
 
     /**
+     * Returns the ClusterApplierService instance.
+     */
+    public ClusterApplierService getClusterApplierService() {
+        return this.clusterApplierService;
+    }
+
+    /**
+     * Returns the MergedSegmentTransferTracker instance.
+     */
+    public MergedSegmentTransferTracker getMergedSegmentTransferTracker() {
+        return this.mergedSegmentTransferTracker;
+    }
+
+    /**
      * Builder for EngineConfig class
      *
-     * @opensearch.internal
+     * @opensearch.api
      */
+    @PublicApi(since = "3.3.0")
     public static class Builder {
         private ShardId shardId;
         private ThreadPool threadPool;
@@ -579,7 +666,11 @@ public final class EngineConfig {
         private boolean isReadOnlyReplica;
         private BooleanSupplier startedPrimarySupplier;
         private TranslogFactory translogFactory = new InternalTranslogFactory();
+        private Supplier<DocumentMapperForType> documentMapperForTypeSupplier;
         Comparator<LeafReader> leafSorter;
+        private IndexWriter.IndexReaderWarmer indexReaderWarmer;
+        private ClusterApplierService clusterApplierService;
+        private MergedSegmentTransferTracker mergedSegmentTransferTracker;
 
         public Builder shardId(ShardId shardId) {
             this.shardId = shardId;
@@ -691,6 +782,11 @@ public final class EngineConfig {
             return this;
         }
 
+        public Builder documentMapperForTypeSupplier(Supplier<DocumentMapperForType> documentMapperForTypeSupplier) {
+            this.documentMapperForTypeSupplier = documentMapperForTypeSupplier;
+            return this;
+        }
+
         public Builder translogDeletionPolicyFactory(TranslogDeletionPolicyFactory translogDeletionPolicyFactory) {
             this.translogDeletionPolicyFactory = translogDeletionPolicyFactory;
             return this;
@@ -713,6 +809,21 @@ public final class EngineConfig {
 
         public Builder leafSorter(Comparator<LeafReader> leafSorter) {
             this.leafSorter = leafSorter;
+            return this;
+        }
+
+        public Builder indexReaderWarmer(IndexWriter.IndexReaderWarmer indexReaderWarmer) {
+            this.indexReaderWarmer = indexReaderWarmer;
+            return this;
+        }
+
+        public Builder clusterApplierService(ClusterApplierService clusterApplierService) {
+            this.clusterApplierService = clusterApplierService;
+            return this;
+        }
+
+        public Builder mergedSegmentTransferTracker(MergedSegmentTransferTracker mergedSegmentTransferTracker) {
+            this.mergedSegmentTransferTracker = mergedSegmentTransferTracker;
             return this;
         }
 

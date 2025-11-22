@@ -33,7 +33,6 @@
 package org.opensearch.plugins;
 
 import org.opensearch.bootstrap.BootstrapCheck;
-import org.opensearch.client.Client;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
@@ -58,6 +57,7 @@ import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
 import java.io.Closeable;
@@ -268,5 +268,14 @@ public abstract class Plugin implements Closeable {
      */
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
         return Collections.emptyList();
+    }
+
+    /**
+     * Returns the {@link SecureSettingsFactory} instance that could be used to configure the
+     * security related components (fe. transports)
+     * @return the {@link SecureSettingsFactory} instance
+     */
+    public Optional<SecureSettingsFactory> getSecureSettingFactory(Settings settings) {
+        return Optional.empty();
     }
 }

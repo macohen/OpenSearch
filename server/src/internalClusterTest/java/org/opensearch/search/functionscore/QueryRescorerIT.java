@@ -43,7 +43,6 @@ import org.opensearch.action.search.SearchType;
 import org.opensearch.common.lucene.search.function.CombineFunction;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.Settings.Builder;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.query.Operator;
@@ -84,6 +83,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertSearchResp
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertSecondHit;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertThirdHit;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.hasId;
+import static org.opensearch.test.hamcrest.OpenSearchAssertions.hasMatchedQueries;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.hasScore;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -103,11 +103,6 @@ public class QueryRescorerIT extends ParameterizedStaticSettingsOpenSearchIntegT
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     public void testEnforceWindowSize() throws InterruptedException {
@@ -179,7 +174,7 @@ public class QueryRescorerIT extends ParameterizedStaticSettingsOpenSearchIntegT
             )
             .get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(3L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(3L));
         assertThat(searchResponse.getHits().getMaxScore(), equalTo(searchResponse.getHits().getHits()[0].getScore()));
         assertThat(searchResponse.getHits().getHits()[0].getId(), equalTo("1"));
         assertThat(searchResponse.getHits().getHits()[1].getId(), equalTo("3"));
@@ -455,7 +450,7 @@ public class QueryRescorerIT extends ParameterizedStaticSettingsOpenSearchIntegT
         assertNoFailures(rescored);
         SearchHits leftHits = plain.getHits();
         SearchHits rightHits = rescored.getHits();
-        assertThat(leftHits.getTotalHits().value, equalTo(rightHits.getTotalHits().value));
+        assertThat(leftHits.getTotalHits().value(), equalTo(rightHits.getTotalHits().value()));
         assertThat(leftHits.getHits().length, equalTo(rightHits.getHits().length));
         SearchHit[] hits = leftHits.getHits();
         SearchHit[] rHits = rightHits.getHits();
@@ -600,7 +595,7 @@ public class QueryRescorerIT extends ParameterizedStaticSettingsOpenSearchIntegT
 
             SearchResponse searchResponse = client().prepareSearch()
                 .setSearchType(SearchType.DFS_QUERY_THEN_FETCH)
-                .setQuery(QueryBuilders.matchQuery("field1", "the quick brown").operator(Operator.OR))
+                .setQuery(QueryBuilders.matchQuery("field1", "the quick brown").operator(Operator.OR).queryName("hello-world"))
                 .setRescorer(innerRescoreQuery, 5)
                 .setExplain(true)
                 .get();
@@ -608,7 +603,10 @@ public class QueryRescorerIT extends ParameterizedStaticSettingsOpenSearchIntegT
             assertFirstHit(searchResponse, hasId("1"));
             assertSecondHit(searchResponse, hasId("2"));
             assertThirdHit(searchResponse, hasId("3"));
-
+            final String[] matchedQueries = { "hello-world" };
+            assertFirstHit(searchResponse, hasMatchedQueries(matchedQueries));
+            assertSecondHit(searchResponse, hasMatchedQueries(matchedQueries));
+            assertThirdHit(searchResponse, hasMatchedQueries(matchedQueries));
             for (int j = 0; j < 3; j++) {
                 assertThat(searchResponse.getHits().getAt(j).getExplanation().getDescription(), equalTo(descriptionModes[innerMode]));
             }
@@ -867,7 +865,7 @@ public class QueryRescorerIT extends ParameterizedStaticSettingsOpenSearchIntegT
             .setTrackScores(true)
             .addRescorer(new QueryRescorerBuilder(matchAllQuery()).setRescoreQueryWeight(100.0f), 50)
             .get();
-        assertThat(resp.getHits().getTotalHits().value, equalTo(5L));
+        assertThat(resp.getHits().getTotalHits().value(), equalTo(5L));
         assertThat(resp.getHits().getHits().length, equalTo(5));
         for (SearchHit hit : resp.getHits().getHits()) {
             assertThat(hit.getScore(), equalTo(101f));

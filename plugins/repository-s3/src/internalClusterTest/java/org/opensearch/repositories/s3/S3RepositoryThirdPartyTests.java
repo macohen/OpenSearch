@@ -31,9 +31,10 @@
 
 package org.opensearch.repositories.s3;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
 import software.amazon.awssdk.services.s3.model.StorageClass;
 
-import org.opensearch.action.support.master.AcknowledgedResponse;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
@@ -43,6 +44,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.AbstractThirdPartyRepositoryTestCase;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
+import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.Before;
 
 import java.util.Collection;
@@ -51,9 +53,9 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.Matchers.blankOrNullString;
-import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 
+@ThreadLeakFilters(filters = EventLoopThreadFilter.class)
 public class S3RepositoryThirdPartyTests extends AbstractThirdPartyRepositoryTestCase {
 
     @Override
@@ -95,6 +97,9 @@ public class S3RepositoryThirdPartyTests extends AbstractThirdPartyRepositoryTes
             .put("region", System.getProperty("test.s3.region", "us-west-2"))
             .put("base_path", System.getProperty("test.s3.base", "testpath"));
         final String endpoint = System.getProperty("test.s3.endpoint");
+        final boolean pathStyleAccess = Boolean.parseBoolean(System.getProperty("test.s3.path_style_access"));
+        settings.put("path_style_access", pathStyleAccess);
+
         if (endpoint != null) {
             settings.put("endpoint", endpoint);
         } else {
@@ -111,13 +116,7 @@ public class S3RepositoryThirdPartyTests extends AbstractThirdPartyRepositoryTes
                 settings.put("storage_class", storageClass);
             }
         }
-        AcknowledgedResponse putRepositoryResponse = client().admin()
-            .cluster()
-            .preparePutRepository("test-repo")
-            .setType("s3")
-            .setSettings(settings)
-            .get();
-        assertThat(putRepositoryResponse.isAcknowledged(), equalTo(true));
+        OpenSearchIntegTestCase.putRepository(client().admin().cluster(), repoName, "s3", settings);
     }
 
     @Override

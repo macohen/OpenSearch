@@ -37,7 +37,9 @@ import org.apache.lucene.search.FieldDoc;
 import org.apache.lucene.search.Query;
 import org.opensearch.action.search.SearchShardTask;
 import org.opensearch.action.search.SearchType;
+import org.opensearch.action.support.StreamSearchChannelListener;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.lease.Releasables;
@@ -53,6 +55,8 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.similarity.SimilarityService;
 import org.opensearch.search.RescoreDocIds;
 import org.opensearch.search.SearchExtBuilder;
+import org.opensearch.search.SearchPhaseResult;
+import org.opensearch.search.SearchService;
 import org.opensearch.search.SearchShardTarget;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.BucketCollectorProcessor;
@@ -76,6 +80,7 @@ import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.search.query.ReduceableSearchResult;
 import org.opensearch.search.rescore.RescoreContext;
 import org.opensearch.search.sort.SortAndFormats;
+import org.opensearch.search.streaming.FlushMode;
 import org.opensearch.search.suggest.SuggestionSearchContext;
 
 import java.util.Collection;
@@ -113,12 +118,17 @@ public abstract class SearchContext implements Releasable {
             // should not be called when there is no aggregation collector
             throw new IllegalStateException("Unexpected toAggregators call on NO_OP_BUCKET_COLLECTOR_PROCESSOR");
         }
+
+        @Override
+        public List<InternalAggregation> toInternalAggregations(Collection<Collector> collectors) {
+            // should not be called when there is no aggregation collector
+            throw new IllegalStateException("Unexpected toInternalAggregations call on NO_OP_BUCKET_COLLECTOR_PROCESSOR");
+        }
     };
 
     private final List<Releasable> releasables = new CopyOnWriteArrayList<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private InnerHitsContext innerHitsContext;
-
     private volatile boolean searchTimedOut;
 
     protected SearchContext() {}
@@ -305,6 +315,29 @@ public abstract class SearchContext implements Releasable {
 
     public abstract boolean trackScores();
 
+    /**
+     * Determines whether named queries' scores should be included in the search results.
+     * By default, this is set to return false, indicating that scores from named queries are not included.
+     *
+     * @param includeNamedQueriesScore true to include scores from named queries, false otherwise.
+     */
+    public SearchContext includeNamedQueriesScore(boolean includeNamedQueriesScore) {
+        // Default implementation does nothing and returns this for chaining.
+        // Implementations of SearchContext should override this method to actually store the value.
+        return this;
+    }
+
+    /**
+     * Checks if scores from named queries are included in the search results.
+     *
+     * @return true if scores from named queries are included, false otherwise.
+     */
+    public boolean includeNamedQueriesScore() {
+        // Default implementation returns false.
+        // Implementations of SearchContext should override this method to return the actual value.
+        return false;
+    }
+
     public abstract SearchContext trackTotalHitsUpTo(int trackTotalHits);
 
     /**
@@ -488,5 +521,77 @@ public abstract class SearchContext implements Releasable {
 
     public abstract int getTargetMaxSliceCount();
 
+    @ExperimentalApi
+    public long getStreamingMaxEstimatedBucketCount() {
+        return 100_000L;
+    }
+
+    @ExperimentalApi
+    public double getStreamingMinCardinalityRatio() {
+        return 0.01;
+    }
+
+    @ExperimentalApi
+    public long getStreamingMinEstimatedBucketCount() {
+        return 1000L;
+    }
+
     public abstract boolean shouldUseTimeSeriesDescSortOptimization();
+
+    public boolean getStarTreeIndexEnabled() {
+        return false;
+    }
+
+    public int maxAggRewriteFilters() {
+        return 0;
+    }
+
+    @ExperimentalApi
+    public int filterRewriteSegmentThreshold() {
+        return 0;
+    }
+
+    public int cardinalityAggregationPruningThreshold() {
+        return 0;
+    }
+
+    public int bucketSelectionStrategyFactor() {
+        return SearchService.DEFAULT_BUCKET_SELECTION_STRATEGY_FACTOR;
+    }
+
+    public boolean keywordIndexOrDocValuesEnabled() {
+        return false;
+    }
+
+    @ExperimentalApi
+    public void setStreamChannelListener(StreamSearchChannelListener<SearchPhaseResult, ShardSearchRequest> listener) {
+        throw new IllegalStateException("Set search channel listener should be implemented for stream search");
+    }
+
+    @ExperimentalApi
+    public StreamSearchChannelListener<SearchPhaseResult, ShardSearchRequest> getStreamChannelListener() {
+        throw new IllegalStateException("Get search channel listener should be implemented for stream search");
+    }
+
+    @ExperimentalApi
+    public boolean isStreamSearch() {
+        return false;
+    }
+
+    /**
+     * Gets the resolved flush mode for this search context.
+     */
+    @ExperimentalApi
+    public FlushMode getFlushMode() {
+        return null;
+    }
+
+    /**
+     * Atomically sets the flush mode if not already set. Returns true if successful.
+     */
+    @ExperimentalApi
+    public boolean setFlushModeIfAbsent(FlushMode flushMode) {
+        return false;
+    }
+
 }

@@ -45,7 +45,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.Priority;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -105,11 +104,6 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         );
     }
 
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
     @After
     public void cleanup() throws Exception {
         assertAcked(
@@ -146,7 +140,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         try {
             long counter = 0;
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
             assertThat(searchResponse.getHits().getHits().length, equalTo(35));
             for (SearchHit hit : searchResponse.getHits()) {
                 assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -154,7 +148,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
 
             searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
             assertThat(searchResponse.getHits().getHits().length, equalTo(35));
             for (SearchHit hit : searchResponse.getHits()) {
                 assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -162,7 +156,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
 
             searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
             assertThat(searchResponse.getHits().getHits().length, equalTo(30));
             for (SearchHit hit : searchResponse.getHits()) {
                 assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -201,7 +195,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         try {
             long counter = 0;
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
             assertThat(searchResponse.getHits().getHits().length, equalTo(3));
             for (SearchHit hit : searchResponse.getHits()) {
                 assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -210,7 +204,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             for (int i = 0; i < 32; i++) {
                 searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-                assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+                assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
                 assertThat(searchResponse.getHits().getHits().length, equalTo(3));
                 for (SearchHit hit : searchResponse.getHits()) {
                     assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -220,7 +214,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             // and now, the last one is one
             searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
             assertThat(searchResponse.getHits().getHits().length, equalTo(1));
             for (SearchHit hit : searchResponse.getHits()) {
                 assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -229,7 +223,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             // a the last is zero
             searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
             assertThat(searchResponse.getHits().getHits().length, equalTo(0));
             for (SearchHit hit : searchResponse.getHits()) {
                 assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -260,21 +254,21 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         client().admin().indices().prepareRefresh().get();
         indexRandomForConcurrentSearch("test");
 
-        assertThat(client().prepareSearch().setSize(0).setQuery(matchAllQuery()).get().getHits().getTotalHits().value, equalTo(500L));
+        assertThat(client().prepareSearch().setSize(0).setQuery(matchAllQuery()).get().getHits().getTotalHits().value(), equalTo(500L));
         assertThat(
-            client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value,
+            client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value(),
             equalTo(500L)
         );
         assertThat(
-            client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value,
+            client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value(),
             equalTo(500L)
         );
         assertThat(
-            client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value,
+            client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value(),
             equalTo(0L)
         );
         assertThat(
-            client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value,
+            client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value(),
             equalTo(0L)
         );
 
@@ -295,21 +289,21 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             } while (searchResponse.getHits().getHits().length > 0);
 
             client().admin().indices().prepareRefresh().get();
-            assertThat(client().prepareSearch().setSize(0).setQuery(matchAllQuery()).get().getHits().getTotalHits().value, equalTo(500L));
+            assertThat(client().prepareSearch().setSize(0).setQuery(matchAllQuery()).get().getHits().getTotalHits().value(), equalTo(500L));
             assertThat(
-                client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value,
+                client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value(),
                 equalTo(0L)
             );
             assertThat(
-                client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value,
+                client().prepareSearch().setSize(0).setQuery(termQuery("message", "test")).get().getHits().getTotalHits().value(),
                 equalTo(0L)
             );
             assertThat(
-                client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value,
+                client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value(),
                 equalTo(500L)
             );
             assertThat(
-                client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value,
+                client().prepareSearch().setSize(0).setQuery(termQuery("message", "update")).get().getHits().getTotalHits().value(),
                 equalTo(500L)
             );
         } finally {
@@ -352,13 +346,13 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         long counter1 = 0;
         long counter2 = 0;
 
-        assertThat(searchResponse1.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse1.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse1.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse1.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter1++));
         }
 
-        assertThat(searchResponse2.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse2.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse2.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse2.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter2++));
@@ -368,13 +362,13 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
 
         searchResponse2 = client().prepareSearchScroll(searchResponse2.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-        assertThat(searchResponse1.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse1.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse1.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse1.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter1++));
         }
 
-        assertThat(searchResponse2.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse2.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse2.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse2.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter2++));
@@ -473,13 +467,13 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         long counter1 = 0;
         long counter2 = 0;
 
-        assertThat(searchResponse1.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse1.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse1.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse1.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter1++));
         }
 
-        assertThat(searchResponse2.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse2.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse2.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse2.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter2++));
@@ -489,13 +483,13 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
 
         searchResponse2 = client().prepareSearchScroll(searchResponse2.getScrollId()).setScroll(TimeValue.timeValueMinutes(2)).get();
 
-        assertThat(searchResponse1.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse1.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse1.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse1.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter1++));
         }
 
-        assertThat(searchResponse2.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse2.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse2.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse2.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter2++));
@@ -613,7 +607,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             .addSort("field", SortOrder.ASC)
             .get();
         long counter = 0;
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(100L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(100L));
         assertThat(searchResponse.getHits().getHits().length, equalTo(35));
         for (SearchHit hit : searchResponse.getHits()) {
             assertThat(((Number) hit.getSortValues()[0]).longValue(), equalTo(counter++));
@@ -726,7 +720,7 @@ public class SearchScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             .setScroll(TimeValue.timeValueMinutes(5))
             .get();
         assertNotNull(searchResponse.getScrollId());
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(2L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(2L));
         assertThat(searchResponse.getHits().getHits().length, equalTo(1));
 
         exc = expectThrows(

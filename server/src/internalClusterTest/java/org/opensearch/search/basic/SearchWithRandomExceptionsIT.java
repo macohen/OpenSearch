@@ -49,7 +49,6 @@ import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.Settings.Builder;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.index.MockEngineFactoryPlugin;
 import org.opensearch.index.query.QueryBuilders;
@@ -83,11 +82,6 @@ public class SearchWithRandomExceptionsIT extends ParameterizedStaticSettingsOpe
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     @Override
@@ -199,6 +193,11 @@ public class SearchWithRandomExceptionsIT extends ParameterizedStaticSettingsOpe
                 logger.info("expected SearchPhaseException: [{}]", ex.getMessage());
             }
         }
+
+        // as the index refresh may fail, so the translog in the index will be not flushed,
+        // and `TranslogWriter.buffer` is not null, which causes arrays not been released,
+        // so we need to close the index to release the arrays.
+        cluster().wipeIndices("test");
     }
 
     public static final String EXCEPTION_TOP_LEVEL_RATIO_KEY = "index.engine.exception.ratio.top";

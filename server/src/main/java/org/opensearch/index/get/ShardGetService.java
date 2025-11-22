@@ -32,6 +32,7 @@
 
 package org.opensearch.index.get;
 
+import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexOptions;
@@ -106,13 +107,12 @@ public final class ShardGetService extends AbstractIndexShardComponent {
     }
 
     public GetStats stats() {
-        return new GetStats(
-            existsMetric.count(),
-            TimeUnit.NANOSECONDS.toMillis(existsMetric.sum()),
-            missingMetric.count(),
-            TimeUnit.NANOSECONDS.toMillis(missingMetric.sum()),
-            currentMetric.count()
-        );
+        return new GetStats.Builder().existsCount(existsMetric.count())
+            .existsTimeInMillis(TimeUnit.NANOSECONDS.toMillis(existsMetric.sum()))
+            .missingCount(missingMetric.count())
+            .missingTimeInMillis(TimeUnit.NANOSECONDS.toMillis(missingMetric.sum()))
+            .current(currentMetric.count())
+            .build();
     }
 
     public GetResult get(
@@ -323,6 +323,7 @@ public final class ShardGetService extends AbstractIndexShardComponent {
                                 false,
                                 IndexOptions.NONE,
                                 DocValuesType.NONE,
+                                DocValuesSkipIndexType.NONE,
                                 -1,
                                 Collections.emptyMap(),
                                 0,
@@ -331,6 +332,7 @@ public final class ShardGetService extends AbstractIndexShardComponent {
                                 0,
                                 VectorEncoding.FLOAT32,
                                 VectorSimilarityFunction.EUCLIDEAN,
+                                false,
                                 false
                             );
                             StoredFieldVisitor.Status status = fieldVisitor.needsField(fieldInfo);

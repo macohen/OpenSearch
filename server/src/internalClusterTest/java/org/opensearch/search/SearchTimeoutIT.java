@@ -38,7 +38,6 @@ import org.opensearch.OpenSearchException;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.MockScriptPlugin;
 import org.opensearch.script.Script;
@@ -73,11 +72,6 @@ public class SearchTimeoutIT extends ParameterizedStaticSettingsOpenSearchIntegT
     }
 
     @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
-    @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         return Collections.singleton(ScriptedTimeoutPlugin.class);
     }
@@ -88,8 +82,7 @@ public class SearchTimeoutIT extends ParameterizedStaticSettingsOpenSearchIntegT
     }
 
     public void testSimpleTimeout() throws Exception {
-        final int numDocs = 1000;
-        for (int i = 0; i < numDocs; i++) {
+        for (int i = 0; i < 32; i++) {
             client().prepareIndex("test").setId(Integer.toString(i)).setSource("field", "value").get();
         }
         refresh("test");
@@ -117,7 +110,7 @@ public class SearchTimeoutIT extends ParameterizedStaticSettingsOpenSearchIntegT
             .get();
         assertFalse(searchResponse.isTimedOut());
         assertEquals(0, searchResponse.getFailedShards());
-        assertEquals(numDocs, searchResponse.getHits().getTotalHits().value);
+        assertEquals(numDocs, searchResponse.getHits().getTotalHits().value());
     }
 
     public void testPartialResultsIntolerantTimeout() throws Exception {

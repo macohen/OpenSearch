@@ -43,7 +43,6 @@ import org.opensearch.action.search.SearchType;
 import org.opensearch.common.lucene.search.function.CombineFunction;
 import org.opensearch.common.lucene.search.function.Functions;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.index.fielddata.ScriptDocValues;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.ScriptPlugin;
@@ -71,13 +70,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 
-import static org.opensearch.client.Requests.searchRequest;
 import static org.opensearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.opensearch.index.query.QueryBuilders.functionScoreQuery;
 import static org.opensearch.index.query.QueryBuilders.termQuery;
 import static org.opensearch.index.query.functionscore.ScoreFunctionBuilders.scriptFunction;
 import static org.opensearch.search.SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING;
 import static org.opensearch.search.builder.SearchSourceBuilder.searchSource;
+import static org.opensearch.transport.client.Requests.searchRequest;
 import static org.hamcrest.Matchers.arrayWithSize;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -95,11 +94,6 @@ public class ExplainableScriptIT extends ParameterizedStaticSettingsOpenSearchIn
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     public static class ExplainableScriptPlugin extends Plugin implements ScriptPlugin {
@@ -196,7 +190,7 @@ public class ExplainableScriptIT extends ParameterizedStaticSettingsOpenSearchIn
 
         OpenSearchAssertions.assertNoFailures(response);
         SearchHits hits = response.getHits();
-        assertThat(hits.getTotalHits().value, equalTo(20L));
+        assertThat(hits.getTotalHits().value(), equalTo(20L));
         int idCounter = 19;
         for (SearchHit hit : hits.getHits()) {
             assertThat(hit.getId(), equalTo(Integer.toString(idCounter)));
@@ -243,7 +237,7 @@ public class ExplainableScriptIT extends ParameterizedStaticSettingsOpenSearchIn
 
         OpenSearchAssertions.assertNoFailures(response);
         SearchHits hits = response.getHits();
-        assertThat(hits.getTotalHits().value, equalTo(1L));
+        assertThat(hits.getTotalHits().value(), equalTo(1L));
         assertThat(hits.getHits()[0].getId(), equalTo("1"));
         assertThat(hits.getHits()[0].getExplanation().getDetails(), arrayWithSize(2));
         assertThat(hits.getHits()[0].getExplanation().getDetails()[0].getDescription(), containsString("_name: func1"));

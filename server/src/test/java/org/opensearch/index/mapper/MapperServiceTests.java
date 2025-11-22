@@ -33,6 +33,8 @@
 package org.opensearch.index.mapper;
 
 import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.search.Sort;
+import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.settings.Settings;
@@ -52,6 +54,7 @@ import org.opensearch.index.analysis.TokenFilterFactory;
 import org.opensearch.index.mapper.KeywordFieldMapper.KeywordFieldType;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.index.mapper.NumberFieldMapper.NumberFieldType;
+import org.opensearch.indices.IndicesModule;
 import org.opensearch.indices.InvalidTypeNameException;
 import org.opensearch.indices.analysis.AnalysisModule.AnalysisProvider;
 import org.opensearch.plugins.AnalysisPlugin;
@@ -63,8 +66,11 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
+import static org.opensearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.Matchers.instanceOf;
@@ -78,6 +84,11 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
         return Arrays.asList(InternalSettingsPlugin.class, ReloadableFilterPlugin.class);
     }
 
+    @Override
+    protected boolean forbidPrivateIndexSettings() {
+        return false;
+    }
+
     public void testTypeValidation() {
         InvalidTypeNameException e = expectThrows(InvalidTypeNameException.class, () -> MapperService.validateTypeName("_type"));
         assertEquals("mapping type name [_type] can't start with '_' unless it is called [_doc]", e.getMessage());
@@ -86,6 +97,11 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
         assertEquals("mapping type name [_document] can't start with '_' unless it is called [_doc]", e.getMessage());
 
         MapperService.validateTypeName("_doc"); // no exception
+    }
+
+    public void testGetMetadataFieldsReturnsExpectedSet() throws Throwable {
+        final MapperService mapperService = createIndex("test1").mapperService();
+        assertEquals(mapperService.getMetadataFields(), IndicesModule.getBuiltInMetadataFields());
     }
 
     public void testPreflightUpdateDoesNotChangeMapping() throws Throwable {
@@ -215,14 +231,14 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
         );
     }
 
-    public void testIndexSortWithNestedFields() throws IOException {
-        Settings settings = Settings.builder().put("index.sort.field", "foo").build();
+    public void testIndexSortWithNestedFieldsWithOlderVersion() throws IOException {
+        Settings settings = settings(Version.V_3_0_0).put("index.sort.field", "foo").build();
         IllegalArgumentException invalidNestedException = expectThrows(
             IllegalArgumentException.class,
-            () -> createIndex("test", settings, "t", "nested_field", "type=nested", "foo", "type=keyword")
+            () -> createIndexWithSimpleMappings("test", settings, "nested_field", "type=nested", "foo", "type=keyword")
         );
         assertThat(invalidNestedException.getMessage(), containsString("cannot have nested fields when index sort is activated"));
-        IndexService indexService = createIndex("test", settings, "t", "foo", "type=keyword");
+        IndexService indexService = createIndexWithSimpleMappings("test", settings, "foo", "type=keyword");
         CompressedXContent nestedFieldMapping = new CompressedXContent(
             BytesReference.bytes(
                 XContentFactory.jsonBuilder()
@@ -240,6 +256,64 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
             () -> indexService.mapperService().merge("t", nestedFieldMapping, updateOrPreflight())
         );
         assertThat(invalidNestedException.getMessage(), containsString("cannot have nested fields when index sort is activated"));
+    }
+
+    public void testIndexSortWithNestedFieldsWithNewVersion() throws IOException {
+        Settings settings = settings(Version.CURRENT).put("index.sort.field", "foo").build();
+        IndexService indexService = createIndex("test", settings, "t", "nested_field", "type=nested", "foo", "type=keyword");
+        assertTrue(indexService.getIndexSortSupplier() != null);
+        assertEquals("foo", indexService.getIndexSortSupplier().get().getSort()[0].getField());
+        assertTrue(indexService.mapperService().getIndexSettings().getIndexSortConfig().hasIndexSort());
+        final Sort oldSort = indexService.getIndexSortSupplier().get();
+
+        // adding new nested Field to existing index, index sort should remain same
+        CompressedXContent nestedFieldMapping = new CompressedXContent(
+            BytesReference.bytes(
+                XContentFactory.jsonBuilder()
+                    .startObject()
+                    .startObject("properties")
+                    .startObject("nested_field2")
+                    .field("type", "nested")
+                    .endObject()
+                    .endObject()
+                    .endObject()
+            )
+        );
+        indexService.mapperService().merge("t", nestedFieldMapping, updateOrPreflight());
+        final Sort newSort = indexService.getIndexSortSupplier().get();
+
+        assertTrue(indexService.getIndexSortSupplier() != null);
+        assertEquals(oldSort, newSort);
+        assertEquals(1, indexService.getIndexSortSupplier().get().getSort().length);
+        assertEquals("foo", indexService.getIndexSortSupplier().get().getSort()[0].getField());
+    }
+
+    public void testIndexSortWithNestedFieldsValidation() throws IOException {
+        Settings settings = Settings.builder().putList("index.sort.field", "contacts.age").put("index.sort.order", "desc").build();
+
+        XContentBuilder mapping = jsonBuilder().startObject()
+            .startObject("properties")
+            .startObject("contacts")
+            .field("type", "nested")
+            .startObject("properties")
+            .startObject("name")
+            .field("type", "keyword")
+            .endObject()
+            .startObject("age")
+            .field("type", "integer")
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject()
+            .endObject();
+
+        IllegalArgumentException exception = expectThrows(
+            IllegalArgumentException.class,
+            () -> createIndex("test_nested", settings, "t", mapping)
+        );
+
+        assertThat(exception.getMessage(), containsString("index sorting on nested fields is not supported"));
+
     }
 
     public void testFieldAliasWithMismatchedNestedScope() throws Throwable {
@@ -538,6 +612,28 @@ public class MapperServiceTests extends OpenSearchSingleNodeTestCase {
                 originalTokenFilters,
                 mapperService.fieldType("otherField").getTextSearchInfo().getSearchQuoteAnalyzer()
             )
+        );
+    }
+
+    public void testMapperDynamicAllowedIgnored() {
+        final List<Function<Settings.Builder, Settings.Builder>> scenarios = List.of(
+            (builder) -> builder.putNull(MapperService.INDEX_MAPPER_DYNAMIC_SETTING.getKey()),
+            (builder) -> builder.put(MapperService.INDEX_MAPPER_DYNAMIC_SETTING.getKey(), true),
+            (builder) -> builder.put(MapperService.INDEX_MAPPER_DYNAMIC_SETTING.getKey(), false)
+        );
+
+        for (int i = 0; i < scenarios.size(); i++) {
+            final Settings.Builder defaultSettingsBuilder = Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1);
+
+            final Settings settings = scenarios.get(i).apply(defaultSettingsBuilder).build();
+
+            createIndex("test" + i, settings).mapperService();
+        }
+
+        assertWarnings(
+            "[index.mapper.dynamic] setting was deprecated in OpenSearch and will be removed in a future release! See the breaking changes documentation for the next major version."
         );
     }
 

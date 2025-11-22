@@ -322,7 +322,7 @@ public class SpanNearQueryBuilder extends AbstractQueryBuilder<SpanNearQueryBuil
      *
      * @opensearch.internal
      */
-    public static class SpanGapQueryBuilder implements SpanQueryBuilder {
+    public static class SpanGapQueryBuilder implements SpanQueryBuilder, WithFieldName {
         public static final String NAME = "span_gap";
 
         /** Name of field to match against. */
@@ -358,6 +358,7 @@ public class SpanNearQueryBuilder extends AbstractQueryBuilder<SpanNearQueryBuil
         /**
          * @return fieldName  The name of the field
          */
+        @Override
         public String fieldName() {
             return fieldName;
         }
@@ -372,6 +373,11 @@ public class SpanNearQueryBuilder extends AbstractQueryBuilder<SpanNearQueryBuil
         @Override
         public Query toQuery(QueryShardContext context) throws IOException {
             throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public QueryBuilder filter(QueryBuilder filter) {
+            throw new UnsupportedOperationException("You can't add a filter to a SpanGapQueryBuilder");
         }
 
         @Override

@@ -35,11 +35,10 @@ package org.opensearch.index.mapper;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.search.Query;
-import org.apache.lucene.search.ScoreMode;
-import org.apache.lucene.search.Scorer;
-import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.OpenSearchGenerationException;
+import org.opensearch.Version;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.settings.Settings;
@@ -50,15 +49,18 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.IndexSortConfig;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.index.mapper.MetadataFieldMapper.TypeParser;
+import org.opensearch.index.query.NestedQueryBuilder;
 import org.opensearch.search.internal.SearchContext;
 
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Stream;
@@ -270,25 +272,15 @@ public class DocumentMapper implements ToXContentFragment {
      * Returns the best nested {@link ObjectMapper} instances that is in the scope of the specified nested docId.
      */
     public ObjectMapper findNestedObjectMapper(int nestedDocId, SearchContext sc, LeafReaderContext context) throws IOException {
+        if (sc instanceof NestedQueryBuilder.NestedInnerHitSubContext) {
+            ObjectMapper objectMapper = ((NestedQueryBuilder.NestedInnerHitSubContext) sc).getChildObjectMapper();
+            assert objectMappers().containsKey(objectMapper.fullPath());
+            assert containSubDocIdWithObjectMapper(nestedDocId, objectMapper, sc, context);
+            return objectMapper;
+        }
         ObjectMapper nestedObjectMapper = null;
         for (ObjectMapper objectMapper : objectMappers().values()) {
-            if (!objectMapper.nested().isNested()) {
-                continue;
-            }
-
-            Query filter = objectMapper.nestedTypeFilter();
-            if (filter == null) {
-                continue;
-            }
-            // We can pass down 'null' as acceptedDocs, because nestedDocId is a doc to be fetched and
-            // therefore is guaranteed to be a live doc.
-            final Weight nestedWeight = filter.createWeight(sc.searcher(), ScoreMode.COMPLETE_NO_SCORES, 1f);
-            Scorer scorer = nestedWeight.scorer(context);
-            if (scorer == null) {
-                continue;
-            }
-
-            if (scorer.iterator().advance(nestedDocId) == nestedDocId) {
+            if (containSubDocIdWithObjectMapper(nestedDocId, objectMapper, sc, context)) {
                 if (nestedObjectMapper == null) {
                     nestedObjectMapper = objectMapper;
                 } else {
@@ -299,6 +291,25 @@ public class DocumentMapper implements ToXContentFragment {
             }
         }
         return nestedObjectMapper;
+    }
+
+    private boolean containSubDocIdWithObjectMapper(int nestedDocId, ObjectMapper objectMapper, SearchContext sc, LeafReaderContext context)
+        throws IOException {
+        if (!objectMapper.nested().isNested()) {
+            return false;
+        }
+        Query filter = objectMapper.nestedTypeFilter();
+        if (filter == null) {
+            return false;
+        }
+        // We can pass down 'null' as acceptedDocs, because nestedDocId is a doc to be fetched and
+        // therefore is guaranteed to be a live doc.
+        BitSet nestedDocIds = sc.bitsetFilterCache().getBitSetProducer(filter).getBitSet(context);
+        if (nestedDocIds != null && nestedDocIds.get(nestedDocId)) {
+            return true;
+        } else {
+            return false;
+        }
     }
 
     public DocumentMapper merge(Mapping mapping, MergeReason reason) {
@@ -320,9 +331,39 @@ public class DocumentMapper implements ToXContentFragment {
                 );
             }
         }
+
+        // Indexing Sort with Nested Fields is only supported on & after Version 3.2.0
         if (settings.getIndexSortConfig().hasIndexSort() && hasNestedObjects()) {
-            throw new IllegalArgumentException("cannot have nested fields when index sort is activated");
+            if (settings.getIndexVersionCreated().before(Version.V_3_2_0)) {
+                throw new IllegalArgumentException("cannot have nested fields when index sort is activated");
+            }
+
+            /*
+             * Index sorting works for regular fields across documents that may contain nested objects,
+             * but sorting on fields inside nested objects is not supported. This validation checks
+             * the index sort configuration and throws an exception if any sort field is inside
+             * a nested object.
+             */
+            List<String> sortFields = settings.getValue(IndexSortConfig.INDEX_SORT_FIELD_SETTING);
+            for (String sortField : sortFields) {
+                Mapper mapper = this.fieldMappers.getMapper(sortField);
+                if (mapper != null && mapper.name().contains(".")) {
+                    String parentPath = mapper.name().substring(0, mapper.name().lastIndexOf('.'));
+                    ObjectMapper nestedParent = objectMappers().get(parentPath);
+                    if (nestedParent != null && nestedParent.nested().isNested()) {
+                        throw new IllegalArgumentException(
+                            "index sorting on nested fields is not supported: "
+                                + "found nested sort field ["
+                                + sortField
+                                + "] in ["
+                                + settings.getIndex().getName()
+                                + "]"
+                        );
+                    }
+                }
+            }
         }
+
         if (checkLimits) {
             this.fieldMappers.checkLimits(settings);
         }

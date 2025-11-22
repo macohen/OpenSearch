@@ -37,6 +37,7 @@ import com.carrotsearch.randomizedtesting.generators.RandomNumbers;
 import com.carrotsearch.randomizedtesting.generators.RandomPicks;
 
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.tests.util.LuceneTestCase;
@@ -47,6 +48,7 @@ import org.opensearch.action.admin.cluster.health.ClusterHealthRequest;
 import org.opensearch.action.admin.cluster.health.ClusterHealthResponse;
 import org.opensearch.action.admin.cluster.node.hotthreads.NodeHotThreads;
 import org.opensearch.action.admin.cluster.node.info.NodesInfoResponse;
+import org.opensearch.action.admin.cluster.repositories.put.PutRepositoryRequestBuilder;
 import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest;
 import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.admin.cluster.tasks.PendingClusterTasksResponse;
@@ -69,15 +71,13 @@ import org.opensearch.action.search.ClearScrollResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.WriteRequest;
-import org.opensearch.client.AdminClient;
-import org.opensearch.client.Client;
-import org.opensearch.client.ClusterAdminClient;
-import org.opensearch.client.Requests;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.client.RestClient;
 import org.opensearch.cluster.ClusterModule;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.coordination.OpenSearchNodeCommand;
 import org.opensearch.cluster.health.ClusterHealthStatus;
+import org.opensearch.cluster.metadata.Context;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
@@ -89,11 +89,15 @@ import org.opensearch.cluster.routing.allocation.DiskThresholdSettings;
 import org.opensearch.cluster.routing.allocation.decider.AwarenessAllocationDecider;
 import org.opensearch.cluster.routing.allocation.decider.EnableAllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.cluster.service.applicationtemplates.TestSystemTemplatesRepositoryPlugin;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.Priority;
+import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.collect.Tuple;
+import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.network.NetworkModule;
 import org.opensearch.common.regex.Regex;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.FeatureFlagSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
@@ -114,6 +118,7 @@ import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -123,6 +128,7 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.env.Environment;
 import org.opensearch.env.TestEnvironment;
 import org.opensearch.index.IndexModule;
+import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.MergeSchedulerConfig;
 import org.opensearch.index.MockEngineFactoryPlugin;
@@ -131,15 +137,28 @@ import org.opensearch.index.codec.CodecService;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.mapper.CompletionFieldMapper;
 import org.opensearch.index.mapper.MockFieldFilterPlugin;
+import org.opensearch.index.remote.RemoteStoreEnums;
+import org.opensearch.index.remote.RemoteStoreEnums.PathType;
+import org.opensearch.index.remote.RemoteStorePathStrategy;
+import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.IndicesQueryCache;
 import org.opensearch.indices.IndicesRequestCache;
+import org.opensearch.indices.IndicesService;
+import org.opensearch.indices.RemoteStoreSettings;
+import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.indices.store.IndicesStore;
 import org.opensearch.monitor.os.OsInfo;
 import org.opensearch.node.NodeMocksPlugin;
+import org.opensearch.node.remotestore.RemoteStoreNodeService;
 import org.opensearch.plugins.NetworkPlugin;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PluginInfo;
+import org.opensearch.repositories.IndexId;
+import org.opensearch.repositories.blobstore.BlobStoreRepository;
+import org.opensearch.repositories.fs.FsRepository;
+import org.opensearch.repositories.fs.ReloadableFsRepository;
 import org.opensearch.script.MockScriptService;
 import org.opensearch.search.MockSearchService;
 import org.opensearch.search.SearchHit;
@@ -155,6 +174,10 @@ import org.opensearch.transport.TransportInterceptor;
 import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.TransportRequestHandler;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.AdminClient;
+import org.opensearch.transport.client.Client;
+import org.opensearch.transport.client.ClusterAdminClient;
+import org.opensearch.transport.client.Requests;
 import org.hamcrest.Matchers;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -170,7 +193,7 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.URL;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -182,6 +205,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -191,14 +215,29 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import reactor.util.annotation.NonNull;
+
 import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS;
+import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SEARCH_REPLICAS;
 import static org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS;
 import static org.opensearch.common.unit.TimeValue.timeValueMillis;
 import static org.opensearch.core.common.util.CollectionUtils.eagerPartition;
 import static org.opensearch.discovery.DiscoveryModule.DISCOVERY_SEED_PROVIDERS_SETTING;
 import static org.opensearch.discovery.SettingsBasedSeedHostsProvider.DISCOVERY_SEED_HOSTS_SETTING;
+import static org.opensearch.index.IndexSettings.INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING;
+import static org.opensearch.index.IndexSettings.INDEX_DOC_ID_FUZZY_SET_FALSE_POSITIVE_PROBABILITY_SETTING;
 import static org.opensearch.index.IndexSettings.INDEX_SOFT_DELETES_RETENTION_LEASE_PERIOD_SETTING;
 import static org.opensearch.index.query.QueryBuilders.matchAllQuery;
+import static org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm.FNV_1A_COMPOSITE_1;
+import static org.opensearch.indices.IndicesService.CLUSTER_REPLICATION_TYPE_SETTING;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeAttribute.REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY;
+import static org.opensearch.node.remotestore.RemoteStoreNodeService.MIGRATION_DIRECTION_SETTING;
+import static org.opensearch.node.remotestore.RemoteStoreNodeService.REMOTE_STORE_COMPATIBILITY_MODE_SETTING;
 import static org.opensearch.test.XContentTestUtils.convertToMap;
 import static org.opensearch.test.XContentTestUtils.differenceBetweenMapsIgnoringArrayOrder;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
@@ -360,8 +399,28 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      */
     public static final String TESTS_CLUSTER_NAME = "tests.clustername";
 
+    protected static final String REMOTE_BACKED_STORAGE_REPOSITORY_NAME = "test-remote-store-repo";
+
+    protected static Boolean prefixModeVerificationEnable;
+
+    protected static Boolean translogPathFixedPrefix;
+
+    protected static Boolean segmentsPathFixedPrefix;
+
+    protected static Boolean snapshotShardPathFixedPrefix;
+
+    private Path remoteStoreRepositoryPath;
+
+    private ReplicationType randomReplicationType;
+
+    private String randomStorageType;
+
     @BeforeClass
     public static void beforeClass() throws Exception {
+        prefixModeVerificationEnable = randomBoolean();
+        translogPathFixedPrefix = randomBoolean();
+        segmentsPathFixedPrefix = randomBoolean();
+        snapshotShardPathFixedPrefix = randomBoolean();
         testClusterRule.beforeClass();
     }
 
@@ -420,10 +479,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         setRandomIndexTranslogSettings(random, builder);
 
         if (random.nextBoolean()) {
-            builder.put(MergeSchedulerConfig.AUTO_THROTTLE_SETTING.getKey(), false);
-        }
-
-        if (random.nextBoolean()) {
             builder.put(IndicesRequestCache.INDEX_CACHE_REQUEST_ENABLED_SETTING.getKey(), random.nextBoolean());
         }
 
@@ -446,20 +501,22 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return builder;
     }
 
-    private static Settings.Builder setRandomIndexMergeSettings(Random random, Settings.Builder builder) {
+    protected Settings.Builder setRandomIndexMergeSettings(Random random, Settings.Builder builder) {
         if (random.nextBoolean()) {
             builder.put(
                 TieredMergePolicyProvider.INDEX_COMPOUND_FORMAT_SETTING.getKey(),
                 (random.nextBoolean() ? random.nextDouble() : random.nextBoolean()).toString()
             );
         }
-        switch (random.nextInt(4)) {
-            case 3:
-                final int maxThreadCount = RandomNumbers.randomIntBetween(random, 1, 4);
-                final int maxMergeCount = RandomNumbers.randomIntBetween(random, maxThreadCount, maxThreadCount + 4);
-                builder.put(MergeSchedulerConfig.MAX_MERGE_COUNT_SETTING.getKey(), maxMergeCount);
-                builder.put(MergeSchedulerConfig.MAX_THREAD_COUNT_SETTING.getKey(), maxThreadCount);
-                break;
+        int value = random.nextInt(4);
+        if (value == 3) {
+            final int maxThreadCount = RandomNumbers.randomIntBetween(random, 1, 4);
+            final int maxMergeCount = RandomNumbers.randomIntBetween(random, maxThreadCount, maxThreadCount + 4);
+            builder.put(MergeSchedulerConfig.MAX_MERGE_COUNT_SETTING.getKey(), maxMergeCount);
+            builder.put(MergeSchedulerConfig.MAX_THREAD_COUNT_SETTING.getKey(), maxThreadCount);
+        }
+        if (value % 2 == 1) {
+            builder.put(MergeSchedulerConfig.AUTO_THROTTLE_SETTING.getKey(), false);
         }
 
         return builder;
@@ -630,6 +687,11 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             );
         }
 
+        if (randomBoolean()) {
+            builder.put(INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING.getKey(), true);
+            builder.put(INDEX_DOC_ID_FUZZY_SET_FALSE_POSITIVE_PROBABILITY_SETTING.getKey(), randomDoubleBetween(0.01, 0.50, true));
+        }
+
         return builder.build();
     }
 
@@ -646,6 +708,8 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         }
         // Enabling Telemetry setting by default
         featureSettings.put(FeatureFlags.TELEMETRY_SETTING.getKey(), true);
+        featureSettings.put(FeatureFlags.APPLICATION_BASED_CONFIGURATION_TEMPLATES_SETTING.getKey(), true);
+
         return featureSettings.build();
     }
 
@@ -699,6 +763,20 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      */
     public final void createIndex(String name, Settings indexSettings) {
         assertAcked(prepareCreate(name).setSettings(indexSettings));
+    }
+
+    /**
+     * creates an index with the given setting and mapping
+     */
+    public final void createIndex(String name, Settings indexSettings, String mapping) {
+        assertAcked(prepareCreate(name).setSettings(indexSettings).setMapping(mapping));
+    }
+
+    /**
+     * creates an index with the given setting
+     */
+    public final void createIndex(String name, Context context) {
+        assertAcked(prepareCreate(name).setContext(context));
     }
 
     /**
@@ -775,9 +853,11 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     /** Ensures the result counts are as expected, and logs the results if different */
     public void assertResultsAndLogOnFailure(long expectedResults, SearchResponse searchResponse) {
         final TotalHits totalHits = searchResponse.getHits().getTotalHits();
-        if (totalHits.value != expectedResults || totalHits.relation != TotalHits.Relation.EQUAL_TO) {
+        if (totalHits.value() != expectedResults || totalHits.relation() != TotalHits.Relation.EQUAL_TO) {
             StringBuilder sb = new StringBuilder("search result contains [");
-            String value = Long.toString(totalHits.value) + (totalHits.relation == TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO ? "+" : "");
+            String value = Long.toString(totalHits.value()) + (totalHits.relation() == TotalHits.Relation.GREATER_THAN_OR_EQUAL_TO
+                ? "+"
+                : "");
             sb.append(value).append("] results. expected [").append(expectedResults).append("]");
             String failMsg = sb.toString();
             for (SearchHit hit : searchResponse.getHits().getHits()) {
@@ -827,6 +907,10 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return ensureColor(ClusterHealthStatus.GREEN, timeout, false, indices);
     }
 
+    public ClusterHealthStatus ensureGreen(TimeValue timeout, boolean waitForNoRelocatingShards, String... indices) {
+        return ensureColor(ClusterHealthStatus.GREEN, timeout, waitForNoRelocatingShards, false, indices);
+    }
+
     /**
      * Ensures the cluster has a yellow state via the cluster health API.
      */
@@ -855,6 +939,16 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         boolean waitForNoInitializingShards,
         String... indices
     ) {
+        return ensureColor(clusterHealthStatus, timeout, true, waitForNoInitializingShards, indices);
+    }
+
+    private ClusterHealthStatus ensureColor(
+        ClusterHealthStatus clusterHealthStatus,
+        TimeValue timeout,
+        boolean waitForNoRelocatingShards,
+        boolean waitForNoInitializingShards,
+        String... indices
+    ) {
         String color = clusterHealthStatus.name().toLowerCase(Locale.ROOT);
         String method = "ensure" + Strings.capitalize(color);
 
@@ -862,7 +956,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             .timeout(timeout)
             .waitForStatus(clusterHealthStatus)
             .waitForEvents(Priority.LANGUID)
-            .waitForNoRelocatingShards(true)
+            .waitForNoRelocatingShards(waitForNoRelocatingShards)
             .waitForNoInitializingShards(waitForNoInitializingShards)
             // We currently often use ensureGreen or ensureYellow to check whether the cluster is back in a good state after shutting down
             // a node. If the node that is stopped is the cluster-manager node, another node will become cluster-manager and publish a
@@ -958,7 +1052,8 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
                         .setQuery(matchAllQuery())
                         .get()
                         .getHits()
-                        .getTotalHits().value;
+                        .getTotalHits()
+                        .value();
 
                     if (count == lastKnownCount) {
                         // no progress - try to refresh for the next time
@@ -1546,14 +1641,17 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         if (dummyDocuments) {
             indexRandomForMultipleSlices(indicesArray);
         }
+        if (forceRefresh) {
+            waitForReplication();
+        }
     }
 
     /*
-    * This method ingests bogus documents for the given indices such that multiple slices
-    * are formed. This is useful for testing with the concurrent search use-case as it creates
-    * multiple slices based on segment count.
-    * @param indices         the indices in which bogus documents should be ingested
-    * */
+     * This method ingests bogus documents for the given indices such that multiple slices
+     * are formed. This is useful for testing with the concurrent search use-case as it creates
+     * multiple slices based on segment count.
+     * @param indices         the indices in which bogus documents should be ingested
+     * */
     protected void indexRandomForMultipleSlices(String... indices) throws InterruptedException {
         Set<List<String>> bogusIds = new HashSet<>();
         int refreshCount = randomIntBetween(2, 3);
@@ -1857,6 +1955,12 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             .put(SearchService.LOW_LEVEL_CANCELLATION_SETTING.getKey(), randomBoolean())
             .putList(DISCOVERY_SEED_HOSTS_SETTING.getKey()) // empty list disables a port scan for other nodes
             .putList(DISCOVERY_SEED_PROVIDERS_SETTING.getKey(), "file")
+            // By default, for tests we will put the target slice count of 2. This will increase the probability of having multiple slices
+            // when tests are run with concurrent segment search enabled
+            .put(SearchService.CONCURRENT_SEGMENT_SEARCH_MAX_SLICE_COUNT_KEY, 2)
+            // Set the field data cache clean interval setting to 1s so assertBusy() can ensure cache is cleared post-test within its
+            // default 10s limit.
+            .put(IndicesService.INDICES_CACHE_CLEAN_INTERVAL_SETTING.getKey(), "1s")
             .put(featureFlagSettings());
 
         // Enable tracer only when Telemetry Setting is enabled
@@ -1864,12 +1968,31 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             builder.put(TelemetrySettings.TRACER_FEATURE_ENABLED_SETTING.getKey(), true);
             builder.put(TelemetrySettings.TRACER_ENABLED_SETTING.getKey(), true);
         }
-        if (FeatureFlags.CONCURRENT_SEGMENT_SEARCH_SETTING.get(featureFlagSettings)) {
-            // By default, for tests we will put the target slice count of 2. This will increase the probability of having multiple slices
-            // when tests are run with concurrent segment search enabled
-            builder.put(SearchService.CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_KEY, 2);
+
+        // Randomly set a Replication Strategy and storage type for the node. Both Replication Strategy and Storage Type can still be
+        // manually overridden by subclass if needed.
+        if (useRandomReplicationStrategy()) {
+            if (randomReplicationType.equals(ReplicationType.SEGMENT) && randomStorageType.equals("REMOTE_STORE")) {
+                logger.info("Randomly using Replication Strategy as {} and Storage Type as {}.", randomReplicationType, randomStorageType);
+                if (remoteStoreRepositoryPath == null) {
+                    remoteStoreRepositoryPath = randomRepoPath().toAbsolutePath();
+                }
+                builder.put(remoteStoreClusterSettings(REMOTE_BACKED_STORAGE_REPOSITORY_NAME, remoteStoreRepositoryPath));
+            } else {
+                logger.info("Randomly using Replication Strategy as {} and Storage Type as {}.", randomReplicationType, randomStorageType);
+                builder.put(CLUSTER_REPLICATION_TYPE_SETTING.getKey(), randomReplicationType);
+            }
         }
         return builder.build();
+    }
+
+    /**
+     * Used for selecting random replication strategy, either DOCUMENT or SEGMENT.
+     * This method must be overridden by subclass to use random replication strategy.
+     * Should be used only on test classes where replication strategy is not critical for tests.
+     */
+    protected boolean useRandomReplicationStrategy() {
+        return false;
     }
 
     protected Path nodeConfigPath(int nodeOrdinal) {
@@ -1883,14 +2006,21 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return Collections.emptyList();
     }
 
+    /**
+     * Returns a collection of plugins that should be loaded on each node.
+     */
+    protected Collection<PluginInfo> additionalNodePlugins() {
+        return Collections.emptyList();
+    }
+
     private ExternalTestCluster buildExternalCluster(String clusterAddresses, String clusterName) throws IOException {
         String[] stringAddresses = clusterAddresses.split(",");
         TransportAddress[] transportAddresses = new TransportAddress[stringAddresses.length];
         int i = 0;
         for (String stringAddress : stringAddresses) {
-            URL url = new URL("http://" + stringAddress);
-            InetAddress inetAddress = InetAddress.getByName(url.getHost());
-            transportAddresses[i++] = new TransportAddress(new InetSocketAddress(inetAddress, url.getPort()));
+            URI uri = URI.create("http://" + stringAddress);
+            InetAddress inetAddress = InetAddress.getByName(uri.getHost());
+            transportAddresses[i++] = new TransportAddress(new InetSocketAddress(inetAddress, uri.getPort()));
         }
         return new ExternalTestCluster(
             createTempDir(),
@@ -1911,6 +2041,14 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     }
 
     protected TestCluster buildTestCluster(Scope scope, long seed) throws IOException {
+        if (useRandomReplicationStrategy()) {
+            randomReplicationType = randomBoolean() ? ReplicationType.DOCUMENT : ReplicationType.SEGMENT;
+            if (randomReplicationType.equals(ReplicationType.SEGMENT)) {
+                randomStorageType = randomBoolean() ? "REMOTE_STORE" : "LOCAL";
+            } else {
+                randomStorageType = "LOCAL";
+            }
+        }
         String clusterAddresses = System.getProperty(TESTS_CLUSTER);
         if (Strings.hasLength(clusterAddresses) && ignoreExternalCluster() == false) {
             if (scope == Scope.TEST) {
@@ -1996,6 +2134,11 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             public Collection<Class<? extends Plugin>> nodePlugins() {
                 return OpenSearchIntegTestCase.this.nodePlugins();
             }
+
+            @Override
+            public Collection<PluginInfo> additionalNodePlugins() {
+                return OpenSearchIntegTestCase.this.additionalNodePlugins();
+            }
         };
     }
 
@@ -2004,6 +2147,10 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
      * The default is {@code true}.
      */
     protected boolean addMockTransportService() {
+        return true;
+    }
+
+    protected boolean addMockIndexStorePlugin() {
         return true;
     }
 
@@ -2049,7 +2196,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
             if (randomBoolean() && addMockTransportService()) {
                 mocks.add(MockTransportService.TestPlugin.class);
             }
-            if (randomBoolean()) {
+            if (randomBoolean() && addMockIndexStorePlugin()) {
                 mocks.add(MockFSIndexStore.TestPlugin.class);
             }
             if (randomBoolean()) {
@@ -2080,6 +2227,7 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         if (addMockTelemetryPlugin()) {
             mocks.add(MockTelemetryPlugin.class);
         }
+        mocks.add(TestSystemTemplatesRepositoryPlugin.class);
         return Collections.unmodifiableList(mocks);
     }
 
@@ -2143,7 +2291,9 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         assertThat(metadata.hasIndex(index), equalTo(true));
         int numShards = Integer.valueOf(metadata.index(index).getSettings().get(SETTING_NUMBER_OF_SHARDS));
         int numReplicas = Integer.valueOf(metadata.index(index).getSettings().get(SETTING_NUMBER_OF_REPLICAS));
-        return new NumShards(numShards, numReplicas);
+        String numSearchReplicasValue = metadata.index(index).getSettings().get(SETTING_NUMBER_OF_SEARCH_REPLICAS);
+        int numSearchReplicas = numSearchReplicasValue != null ? Integer.parseInt(numSearchReplicasValue) : 0;
+        return new NumShards(numShards, numReplicas, numSearchReplicas);
     }
 
     /**
@@ -2184,13 +2334,15 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
     protected static class NumShards {
         public final int numPrimaries;
         public final int numReplicas;
+        public final int numSearchReplicas;
         public final int totalNumShards;
         public final int dataCopies;
 
-        private NumShards(int numPrimaries, int numReplicas) {
+        private NumShards(int numPrimaries, int numReplicas, int numSearchReplicas) {
             this.numPrimaries = numPrimaries;
             this.numReplicas = numReplicas;
-            this.dataCopies = numReplicas + 1;
+            this.numSearchReplicas = numSearchReplicas;
+            this.dataCopies = numReplicas + numSearchReplicas + 1;
             this.totalNumShards = numPrimaries * dataCopies;
         }
     }
@@ -2266,10 +2418,6 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return getIndexResponse.getSettings().get(index).get(IndexMetadata.SETTING_DATA_PATH);
     }
 
-    public static boolean inFipsJvm() {
-        return Boolean.parseBoolean(System.getProperty(FIPS_SYSPROP));
-    }
-
     /**
      * On Debian 8 the "memory" subsystem is not mounted by default
      * when cgroups are enabled, and this confuses many versions of
@@ -2339,6 +2487,12 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return clusterState.getRoutingNodes().node(nodeId).node().getName();
     }
 
+    protected String primaryNodeName(String indexName, int shardId) {
+        ClusterState clusterState = client().admin().cluster().prepareState().get().getState();
+        String nodeId = clusterState.getRoutingTable().index(indexName).shard(shardId).primaryShard().currentNodeId();
+        return clusterState.getRoutingNodes().node(nodeId).node().getName();
+    }
+
     protected String replicaNodeName(String indexName) {
         ClusterState clusterState = client().admin().cluster().prepareState().get().getState();
         String nodeId = clusterState.getRoutingTable().index(indexName).shard(0).replicaShards().get(0).currentNodeId();
@@ -2349,4 +2503,491 @@ public abstract class OpenSearchIntegTestCase extends OpenSearchTestCase {
         return client(internalCluster().getClusterManagerName()).admin().cluster().prepareState().get().getState();
     }
 
+    /**
+     * Refreshes the indices in the cluster and waits until active/started replica shards
+     * are caught up with primary shard only when Segment Replication is enabled.
+     * This doesn't wait for inactive/non-started replica shards to become active/started.
+     */
+    protected RefreshResponse refreshAndWaitForReplication(String... indices) {
+        RefreshResponse refreshResponse = refresh(indices);
+        waitForReplication();
+        return refreshResponse;
+    }
+
+    public boolean isMigratingToRemoteStore() {
+        ClusterSettings clusterSettings = clusterService().getClusterSettings();
+        boolean isMixedMode = clusterSettings.get(REMOTE_STORE_COMPATIBILITY_MODE_SETTING)
+            .equals(RemoteStoreNodeService.CompatibilityMode.MIXED);
+        boolean isRemoteStoreMigrationDirection = clusterSettings.get(MIGRATION_DIRECTION_SETTING)
+            .equals(RemoteStoreNodeService.Direction.REMOTE_STORE);
+        return (isMixedMode && isRemoteStoreMigrationDirection);
+    }
+
+    /**
+     * Waits until active/started replica shards are caught up with primary shard only when Segment Replication is enabled.
+     * This doesn't wait for inactive/non-started replica shards to become active/started.
+     */
+    protected void waitForReplication(String... indices) {
+        if (indices.length == 0) {
+            indices = getClusterState().routingTable().indicesRouting().keySet().toArray(String[]::new);
+        }
+        try {
+            for (String index : indices) {
+                if (isSegmentReplicationEnabledForIndex(index)) {
+                    if (isInternalCluster()) {
+                        IndexRoutingTable indexRoutingTable = getClusterState().routingTable().index(index);
+                        if (indexRoutingTable != null) {
+                            assertBusy(() -> {
+                                for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
+                                    final ShardRouting primaryRouting = shardRoutingTable.primaryShard();
+                                    if (primaryRouting.state().toString().equals("STARTED")) {
+                                        if (isSegmentReplicationEnabledForIndex(index)) {
+                                            final List<ShardRouting> replicaRouting = shardRoutingTable.replicaShards();
+                                            final IndexShard primaryShard = getIndexShard(primaryRouting, index);
+                                            for (ShardRouting replica : replicaRouting) {
+                                                if (replica.state().toString().equals("STARTED")) {
+                                                    IndexShard replicaShard = getIndexShard(replica, index);
+                                                    if (replicaShard.indexSettings().isSegRepEnabledOrRemoteNode()) {
+                                                        assertEquals(
+                                                            "replica shards haven't caught up with primary",
+                                                            getLatestSegmentInfoVersion(primaryShard),
+                                                            getLatestSegmentInfoVersion(replicaShard)
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }, 30, TimeUnit.SECONDS);
+                        }
+                    } else {
+                        throw new IllegalStateException(
+                            "Segment Replication is not supported for testing tests using External Test Cluster"
+                        );
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Checks if Segment Replication is enabled on Index.
+     */
+    protected boolean isSegmentReplicationEnabledForIndex(String index) {
+        return clusterService().state().getMetadata().isSegmentReplicationEnabled(index) || isMigratingToRemoteStore();
+    }
+
+    protected IndexShard getIndexShard(ShardRouting routing, String indexName) {
+        return getIndexShard(getClusterState().nodes().get(routing.currentNodeId()).getName(), routing.shardId(), indexName);
+    }
+
+    /**
+     * Fetch IndexShard by shardId, multiple shards per node allowed.
+     */
+    protected IndexShard getIndexShard(String node, ShardId shardId, String indexName) {
+        final Index index = resolveIndex(indexName);
+        IndicesService indicesService = internalCluster().getInstance(IndicesService.class, node);
+        IndexService indexService = indicesService.indexServiceSafe(index);
+        final Optional<Integer> id = indexService.shardIds().stream().filter(sid -> sid.equals(shardId.id())).findFirst();
+        return indexService.getShard(id.get());
+    }
+
+    /**
+     * Fetch latest segment info snapshot version of an index.
+     */
+    protected long getLatestSegmentInfoVersion(IndexShard shard) {
+        try (final GatedCloseable<SegmentInfos> snapshot = shard.getSegmentInfosSnapshot()) {
+            return snapshot.get().version;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    protected void createRepository(String repoName, String type, Settings.Builder settings, String timeout) {
+        logger.info("--> creating repository [{}] [{}]", repoName, type);
+        putRepository(clusterAdmin(), repoName, type, timeout, settings);
+    }
+
+    protected void createRepository(String repoName, String type, Settings.Builder settings) {
+        logger.info("--> creating repository [{}] [{}]", repoName, type);
+        putRepository(clusterAdmin(), repoName, type, null, settings);
+    }
+
+    protected void updateRepository(String repoName, String type, Settings.Builder settings) {
+        logger.info("--> updating repository [{}] [{}]", repoName, type);
+        putRepository(clusterAdmin(), repoName, type, null, settings);
+    }
+
+    public Settings getNodeSettings() {
+        InternalTestCluster internalTestCluster = internalCluster();
+        ClusterService clusterService = internalTestCluster.getInstance(ClusterService.class, internalTestCluster.getClusterManagerName());
+        return clusterService.getSettings();
+    }
+
+    public static void putRepository(ClusterAdminClient adminClient, String repoName, String type, Settings.Builder settings) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, true, settings, null, false));
+    }
+
+    public static void putRepository(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        String timeout,
+        Settings.Builder settings
+    ) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, true, settings, timeout, false));
+    }
+
+    public static void putRepository(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        boolean verify,
+        Settings.Builder settings
+    ) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, verify, settings, null, false));
+    }
+
+    public static void putRepositoryWithNoSettingOverrides(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        boolean verify,
+        Settings.Builder settings
+    ) {
+        assertAcked(putRepositoryRequestBuilder(adminClient, repoName, type, verify, settings, null, true));
+    }
+
+    public static void putRepository(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        Settings.Builder settings,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
+        putRepositoryRequestBuilder(adminClient, repoName, type, true, settings, null, false).execute(listener);
+    }
+
+    public static PutRepositoryRequestBuilder putRepositoryRequestBuilder(
+        ClusterAdminClient adminClient,
+        String repoName,
+        String type,
+        boolean verify,
+        Settings.Builder settings,
+        String timeout,
+        boolean finalSettings
+    ) {
+        PutRepositoryRequestBuilder builder = adminClient.preparePutRepository(repoName).setType(type).setVerify(verify);
+        if (timeout != null) {
+            builder.setTimeout(timeout);
+        }
+        if (finalSettings == false && settings.keys().contains(BlobStoreRepository.SHARD_PATH_TYPE.getKey()) == false) {
+            settings.put(BlobStoreRepository.SHARD_PATH_TYPE.getKey(), randomFrom(PathType.values()));
+        }
+        builder.setSettings(settings);
+        return builder;
+    }
+
+    public static Settings remoteStoreClusterSettings(String name, Path path) {
+        return remoteStoreClusterSettings(name, path, name, path);
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(
+            buildRemoteStoreNodeAttributes(
+                segmentRepoName,
+                segmentRepoPath,
+                segmentRepoType,
+                translogRepoName,
+                translogRepoPath,
+                translogRepoType,
+                false
+            )
+        );
+        return settingsBuilder.build();
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType,
+        String routingTableRepoName,
+        Path routingTableRepoPath,
+        String routingTableRepoType
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(
+            buildRemoteStoreNodeAttributes(
+                segmentRepoName,
+                segmentRepoPath,
+                segmentRepoType,
+                translogRepoName,
+                translogRepoPath,
+                translogRepoType,
+                routingTableRepoName,
+                routingTableRepoPath,
+                routingTableRepoType,
+                false
+            )
+        );
+        return settingsBuilder.build();
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(buildRemoteStoreNodeAttributes(segmentRepoName, segmentRepoPath, translogRepoName, translogRepoPath, false));
+        return settingsBuilder.build();
+    }
+
+    public static Settings remoteStoreClusterSettings(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath,
+        String remoteRoutingTableRepoName,
+        Path remoteRoutingTableRepoPath
+    ) {
+        Settings.Builder settingsBuilder = Settings.builder();
+        settingsBuilder.put(
+            buildRemoteStoreNodeAttributes(
+                segmentRepoName,
+                segmentRepoPath,
+                translogRepoName,
+                translogRepoPath,
+                remoteRoutingTableRepoName,
+                remoteRoutingTableRepoPath,
+                false
+            )
+        );
+        return settingsBuilder.build();
+    }
+
+    public static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath,
+        boolean withRateLimiterAttributes
+    ) {
+        return buildRemoteStoreNodeAttributes(
+            segmentRepoName,
+            segmentRepoPath,
+            ReloadableFsRepository.TYPE,
+            translogRepoName,
+            translogRepoPath,
+            ReloadableFsRepository.TYPE,
+            withRateLimiterAttributes
+        );
+    }
+
+    public static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String translogRepoName,
+        Path translogRepoPath,
+        String remoteRoutingTableRepoName,
+        Path remoteRoutingTableRepoPath,
+        boolean withRateLimiterAttributes
+    ) {
+        return buildRemoteStoreNodeAttributes(
+            segmentRepoName,
+            segmentRepoPath,
+            ReloadableFsRepository.TYPE,
+            translogRepoName,
+            translogRepoPath,
+            ReloadableFsRepository.TYPE,
+            remoteRoutingTableRepoName,
+            remoteRoutingTableRepoPath,
+            FsRepository.TYPE,
+            withRateLimiterAttributes
+        );
+    }
+
+    public static Settings buildRemoteStateNodeAttributes(String stateRepoName, Path stateRepoPath, String stateRepoType) {
+        String stateRepoTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            stateRepoName
+        );
+        String stateRepoSettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            stateRepoName
+        );
+        String prefixModeVerificationSuffix = BlobStoreRepository.PREFIX_MODE_VERIFICATION_SETTING.getKey();
+        Settings.Builder settings = Settings.builder()
+            .put("node.attr." + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY, stateRepoName)
+            .put(stateRepoTypeAttributeKey, stateRepoType)
+            .put(stateRepoSettingsAttributeKeyPrefix + "location", stateRepoPath)
+            .put(stateRepoSettingsAttributeKeyPrefix + prefixModeVerificationSuffix, prefixModeVerificationEnable);
+        return settings.build();
+    }
+
+    private static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType,
+        boolean withRateLimiterAttributes
+    ) {
+        return buildRemoteStoreNodeAttributes(
+            segmentRepoName,
+            segmentRepoPath,
+            segmentRepoType,
+            translogRepoName,
+            translogRepoPath,
+            translogRepoType,
+            null,
+            null,
+            null,
+            withRateLimiterAttributes
+        );
+    }
+
+    protected static Settings buildRemoteStoreNodeAttributes(
+        String segmentRepoName,
+        Path segmentRepoPath,
+        String segmentRepoType,
+        String translogRepoName,
+        Path translogRepoPath,
+        String translogRepoType,
+        String routingTableRepoName,
+        Path routingTableRepoPath,
+        String routingTableRepoType,
+        boolean withRateLimiterAttributes
+    ) {
+        String segmentRepoTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            segmentRepoName
+        );
+        String segmentRepoSettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            segmentRepoName
+        );
+        String translogRepoTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            translogRepoName
+        );
+        String translogRepoSettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            translogRepoName
+        );
+        String routingTableRepoAttributeKey = null, routingTableRepoSettingsAttributeKeyPrefix = null;
+        if (routingTableRepoName != null) {
+            routingTableRepoAttributeKey = String.format(
+                Locale.getDefault(),
+                "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+                routingTableRepoName
+            );
+            routingTableRepoSettingsAttributeKeyPrefix = String.format(
+                Locale.getDefault(),
+                "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+                routingTableRepoName
+            );
+        }
+
+        String prefixModeVerificationSuffix = BlobStoreRepository.PREFIX_MODE_VERIFICATION_SETTING.getKey();
+
+        Settings.Builder settings = Settings.builder()
+            .put("node.attr." + REMOTE_STORE_SEGMENT_REPOSITORY_NAME_ATTRIBUTE_KEY, segmentRepoName)
+            .put(segmentRepoTypeAttributeKey, segmentRepoType)
+            .put(segmentRepoSettingsAttributeKeyPrefix + "location", segmentRepoPath)
+            .put(segmentRepoSettingsAttributeKeyPrefix + prefixModeVerificationSuffix, prefixModeVerificationEnable)
+            .put("node.attr." + REMOTE_STORE_TRANSLOG_REPOSITORY_NAME_ATTRIBUTE_KEY, translogRepoName)
+            .put(translogRepoTypeAttributeKey, translogRepoType)
+            .put(translogRepoSettingsAttributeKeyPrefix + "location", translogRepoPath)
+            .put(translogRepoSettingsAttributeKeyPrefix + prefixModeVerificationSuffix, prefixModeVerificationEnable)
+            .put(buildRemoteStateNodeAttributes(segmentRepoName, segmentRepoPath, segmentRepoType));
+        if (routingTableRepoName != null) {
+            settings.put("node.attr." + REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY, routingTableRepoName)
+                .put(routingTableRepoAttributeKey, routingTableRepoType)
+                .put(routingTableRepoSettingsAttributeKeyPrefix + "location", routingTableRepoPath);
+        }
+
+        if (withRateLimiterAttributes) {
+            settings.put(segmentRepoSettingsAttributeKeyPrefix + "compress", randomBoolean())
+                .put(segmentRepoSettingsAttributeKeyPrefix + "chunk_size", 200, ByteSizeUnit.BYTES);
+        }
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_PATH_TYPE_SETTING.getKey(), randomFrom(PathType.values()));
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_METADATA.getKey(), randomBoolean());
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED.getKey(), randomBoolean());
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX.getKey(), translogPathFixedPrefix ? "a" : "");
+        settings.put(RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX.getKey(), segmentsPathFixedPrefix ? "b" : "");
+        settings.put(BlobStoreRepository.SNAPSHOT_SHARD_PATH_PREFIX_SETTING.getKey(), snapshotShardPathFixedPrefix ? "c" : "");
+        return settings.build();
+    }
+
+    protected Settings buildRemotePublicationNodeAttributes(
+        @NonNull String remoteStateRepoName,
+        @NonNull String remoteStateRepoType,
+        @NonNull String routingTableRepoName,
+        @NonNull String routingTableRepoType
+    ) {
+        String remoteStateRepositoryTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            remoteStateRepoName
+        );
+        String routingTableRepositoryTypeAttributeKey = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_TYPE_ATTRIBUTE_KEY_FORMAT,
+            routingTableRepoName
+        );
+        String remoteStateRepositorySettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            remoteStateRepoName
+        );
+        String routingTableRepositorySettingsAttributeKeyPrefix = String.format(
+            Locale.getDefault(),
+            "node.attr." + REMOTE_STORE_REPOSITORY_SETTINGS_ATTRIBUTE_KEY_PREFIX,
+            routingTableRepoName
+        );
+
+        return Settings.builder()
+            .put("node.attr." + REMOTE_STORE_CLUSTER_STATE_REPOSITORY_NAME_ATTRIBUTE_KEY, remoteStateRepoName)
+            .put("node.attr." + REMOTE_STORE_ROUTING_TABLE_REPOSITORY_NAME_ATTRIBUTE_KEY, routingTableRepoName)
+            .put(remoteStateRepositoryTypeAttributeKey, remoteStateRepoType)
+            .put(routingTableRepositoryTypeAttributeKey, routingTableRepoType)
+            .put(remoteStateRepositorySettingsAttributeKeyPrefix + "location", randomRepoPath().toAbsolutePath())
+            .put(routingTableRepositorySettingsAttributeKeyPrefix + "location", randomRepoPath().toAbsolutePath())
+            .build();
+    }
+
+    public static String resolvePath(IndexId indexId, String shardId) {
+        PathType pathType = PathType.fromCode(indexId.getShardPathType());
+        RemoteStorePathStrategy.SnapshotShardPathInput shardPathInput = new RemoteStorePathStrategy.SnapshotShardPathInput.Builder()
+            .basePath(BlobPath.cleanPath())
+            .indexUUID(indexId.getId())
+            .shardId(shardId)
+            .build();
+        RemoteStoreEnums.PathHashAlgorithm pathHashAlgorithm = pathType != PathType.FIXED ? FNV_1A_COMPOSITE_1 : null;
+        BlobPath blobPath = pathType.path(shardPathInput, pathHashAlgorithm);
+        return blobPath.buildAsString();
+    }
 }

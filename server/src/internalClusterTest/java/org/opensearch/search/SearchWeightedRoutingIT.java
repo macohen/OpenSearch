@@ -480,6 +480,7 @@ public class SearchWeightedRoutingIT extends OpenSearchIntegTestCase {
      * Assertions are put to make sure such shard search requests are served by data node in zone c.
      * @throws IOException throws exception
      */
+    @AwaitsFix(bugUrl = "https://github.com/opensearch-project/OpenSearch/issues/10673")
     public void testShardRoutingWithNetworkDisruption_FailOpenEnabled() throws Exception {
 
         Settings commonSettings = Settings.builder()
@@ -822,7 +823,7 @@ public class SearchWeightedRoutingIT extends OpenSearchIntegTestCase {
             try {
                 SearchResponse searchResponse = responses[i].get();
                 assertEquals(searchResponse.getFailedShards(), 0);
-                assertNotEquals(searchResponse.getHits().getTotalHits().value, 0);
+                assertNotEquals(searchResponse.getHits().getTotalHits().value(), 0);
             } catch (Exception t) {
                 fail("search should not fail");
             }
@@ -978,6 +979,7 @@ public class SearchWeightedRoutingIT extends OpenSearchIntegTestCase {
      * MultiGet with fail open enabled. No request failure on network disruption
      * @throws IOException throws exception
      */
+    @AwaitsFix(bugUrl = "https://github.com/opensearch-project/OpenSearch/issues/10755")
     public void testMultiGetWithNetworkDisruption_FailOpenEnabled() throws Exception {
 
         Settings commonSettings = Settings.builder()

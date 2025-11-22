@@ -35,7 +35,6 @@ import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.Script;
 import org.opensearch.script.ScriptType;
@@ -88,11 +87,6 @@ public class ValueCountIT extends ParameterizedStaticSettingsOpenSearchIntegTest
     }
 
     @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
-    @Override
     public void setupSuiteScopeCluster() throws Exception {
         createIndex("idx");
         createIndex("idx_unmapped");
@@ -120,7 +114,7 @@ public class ValueCountIT extends ParameterizedStaticSettingsOpenSearchIntegTest
             .addAggregation(count("count").field("value"))
             .get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         ValueCount valueCount = searchResponse.getAggregations().get("count");
         assertThat(valueCount, notNullValue());

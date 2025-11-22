@@ -11,10 +11,11 @@ import org.opensearch.Version;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.PlainActionFuture;
-import org.opensearch.client.node.NodeClient;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.OptionallyResolvedIndices;
+import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
@@ -35,6 +36,7 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.RemoteClusterConnectionTests;
 import org.opensearch.transport.Transport;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.node.NodeClient;
 import org.junit.Before;
 
 import java.util.ArrayList;
@@ -714,5 +716,77 @@ public class TransportDeletePitActionTests extends OpenSearchTestCase {
                 assertEquals(3, deleteNodesInvoked.size());
             }
         }
+    }
+
+    public void testResolveIndices() throws InterruptedException, ExecutionException {
+        NodeClient client = new NodeClient(settings, threadPool);
+        client.initialize(null, null, null, namedWriteableRegistry);
+        ActionFilters actionFilters = mock(ActionFilters.class);
+        when(actionFilters.filters()).thenReturn(new ActionFilter[0]);
+
+        try (
+            MockTransportService transportService = MockTransportService.createNewService(
+                Settings.EMPTY,
+                Version.CURRENT,
+                threadPool,
+                NoopTracer.INSTANCE
+            )
+        ) {
+            transportService.start();
+            transportService.acceptIncomingRequests();
+            SearchTransportService searchTransportService = new SearchTransportService(transportService, null) {
+                @Override
+                public Transport.Connection getConnection(String clusterAlias, DiscoveryNode node) {
+                    return new SearchAsyncActionTests.MockConnection(node);
+                }
+            };
+            PitService pitService = new PitService(clusterServiceMock, searchTransportService, transportService, client);
+            TransportDeletePitAction action = new TransportDeletePitAction(
+                transportService,
+                actionFilters,
+                namedWriteableRegistry,
+                pitService
+            );
+            DeletePitRequest deletePITRequest = new DeletePitRequest(pitId);
+            OptionallyResolvedIndices resolvedIndices = action.resolveIndices(deletePITRequest);
+            assertEquals(ResolvedIndices.of("idx", "idy"), resolvedIndices);
+        }
+
+    }
+
+    public void testResolveIndices_allPits() throws InterruptedException, ExecutionException {
+        NodeClient client = new NodeClient(settings, threadPool);
+        client.initialize(null, null, null, namedWriteableRegistry);
+        ActionFilters actionFilters = mock(ActionFilters.class);
+        when(actionFilters.filters()).thenReturn(new ActionFilter[0]);
+
+        try (
+            MockTransportService transportService = MockTransportService.createNewService(
+                Settings.EMPTY,
+                Version.CURRENT,
+                threadPool,
+                NoopTracer.INSTANCE
+            )
+        ) {
+            transportService.start();
+            transportService.acceptIncomingRequests();
+            SearchTransportService searchTransportService = new SearchTransportService(transportService, null) {
+                @Override
+                public Transport.Connection getConnection(String clusterAlias, DiscoveryNode node) {
+                    return new SearchAsyncActionTests.MockConnection(node);
+                }
+            };
+            PitService pitService = new PitService(clusterServiceMock, searchTransportService, transportService, client);
+            TransportDeletePitAction action = new TransportDeletePitAction(
+                transportService,
+                actionFilters,
+                namedWriteableRegistry,
+                pitService
+            );
+            DeletePitRequest deletePITRequest = new DeletePitRequest("_all");
+            OptionallyResolvedIndices resolvedIndices = action.resolveIndices(deletePITRequest);
+            assertEquals(ResolvedIndices.unknown(), resolvedIndices);
+        }
+
     }
 }

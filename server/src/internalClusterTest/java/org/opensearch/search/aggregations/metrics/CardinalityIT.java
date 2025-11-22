@@ -34,10 +34,10 @@ package org.opensearch.search.aggregations.metrics;
 
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
+import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsResponse;
 import org.opensearch.action.index.IndexRequestBuilder;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.index.fielddata.ScriptDocValues;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.script.MockScriptPlugin;
@@ -60,6 +60,7 @@ import java.util.function.Function;
 import static java.util.Collections.emptyMap;
 import static org.opensearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.opensearch.index.query.QueryBuilders.matchAllQuery;
+import static org.opensearch.search.SearchService.CARDINALITY_AGGREGATION_PRUNING_THRESHOLD;
 import static org.opensearch.search.SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING;
 import static org.opensearch.search.aggregations.AggregationBuilders.cardinality;
 import static org.opensearch.search.aggregations.AggregationBuilders.global;
@@ -83,11 +84,6 @@ public class CardinalityIT extends ParameterizedStaticSettingsOpenSearchIntegTes
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     @Override
@@ -259,6 +255,36 @@ public class CardinalityIT extends ParameterizedStaticSettingsOpenSearchIntegTes
         assertThat(count, notNullValue());
         assertThat(count.getName(), equalTo("cardinality"));
         assertCount(count, numDocs);
+    }
+
+    public void testDisableDynamicPruning() throws Exception {
+        SearchResponse response = client().prepareSearch("idx")
+            .addAggregation(cardinality("cardinality").precisionThreshold(precisionThreshold).field("str_value"))
+            .get();
+        assertSearchResponse(response);
+
+        Cardinality count1 = response.getAggregations().get("cardinality");
+
+        final ClusterUpdateSettingsResponse updateSettingResponse = client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setTransientSettings(Settings.builder().put(CARDINALITY_AGGREGATION_PRUNING_THRESHOLD.getKey(), 0))
+            .get();
+        assertEquals(updateSettingResponse.getTransientSettings().get(CARDINALITY_AGGREGATION_PRUNING_THRESHOLD.getKey()), "0");
+
+        response = client().prepareSearch("idx")
+            .addAggregation(cardinality("cardinality").precisionThreshold(precisionThreshold).field("str_value"))
+            .get();
+        assertSearchResponse(response);
+        Cardinality count2 = response.getAggregations().get("cardinality");
+
+        assertEquals(count1, count2);
+
+        client().admin()
+            .cluster()
+            .prepareUpdateSettings()
+            .setTransientSettings(Settings.builder().putNull(CARDINALITY_AGGREGATION_PRUNING_THRESHOLD.getKey()))
+            .get();
     }
 
     public void testSingleValuedNumeric() throws Exception {

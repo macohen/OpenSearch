@@ -36,8 +36,6 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * Extracts Shiro's {@link AuthenticationToken} from different types of auth headers
- *
- * @opensearch.experimental
  */
 class ShiroTokenManager implements TokenManager {
 
@@ -51,8 +49,7 @@ class ShiroTokenManager implements TokenManager {
      * @return An optional of the shiro auth token for login
      */
     public Optional<AuthenticationToken> translateAuthToken(org.opensearch.identity.tokens.AuthToken authenticationToken) {
-        if (authenticationToken instanceof BasicAuthToken) {
-            final BasicAuthToken basicAuthToken = (BasicAuthToken) authenticationToken;
+        if (authenticationToken instanceof BasicAuthToken basicAuthToken) {
             return Optional.of(new UsernamePasswordToken(basicAuthToken.getUser(), basicAuthToken.getPassword()));
         }
         return Optional.empty();
@@ -87,16 +84,14 @@ class ShiroTokenManager implements TokenManager {
     }
 
     public String getTokenInfo(AuthToken token) {
-        if (token instanceof BasicAuthToken) {
-            final BasicAuthToken basicAuthToken = (BasicAuthToken) token;
+        if (token instanceof BasicAuthToken basicAuthToken) {
             return basicAuthToken.toString();
         }
         throw new UnsupportedAuthenticationToken();
     }
 
     public void revokeToken(AuthToken token) {
-        if (token instanceof BasicAuthToken) {
-            final BasicAuthToken basicAuthToken = (BasicAuthToken) token;
+        if (token instanceof BasicAuthToken basicAuthToken) {
             basicAuthToken.revoke();
             return;
         }
@@ -104,8 +99,7 @@ class ShiroTokenManager implements TokenManager {
     }
 
     public void resetToken(AuthToken token) {
-        if (token instanceof BasicAuthToken) {
-            final BasicAuthToken basicAuthToken = (BasicAuthToken) token;
+        if (token instanceof BasicAuthToken basicAuthToken) {
             basicAuthToken.revoke();
         }
     }

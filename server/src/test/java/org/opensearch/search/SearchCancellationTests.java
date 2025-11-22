@@ -51,6 +51,7 @@ import org.apache.lucene.util.automaton.RegExp;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.core.tasks.TaskCancelledException;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.SearchOperationListener;
 import org.opensearch.search.internal.ContextIndexSearcher;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.OpenSearchTestCase;
@@ -138,6 +139,9 @@ public class SearchCancellationTests extends OpenSearchTestCase {
         Runnable cancellation = () -> { throw new TaskCancelledException("cancelled"); };
         IndexShard indexShard = mock(IndexShard.class);
         when(searchContext.indexShard()).thenReturn(indexShard);
+        SearchOperationListener searchOperationListener = new SearchOperationListener() {
+        };
+        when(indexShard.getSearchOperationListener()).thenReturn(searchOperationListener);
         ContextIndexSearcher searcher = new ContextIndexSearcher(
             reader,
             IndexSearcher.getDefaultSimilarity(),
@@ -197,6 +201,7 @@ public class SearchCancellationTests extends OpenSearchTestCase {
         );
 
         cancelled.set(false); // Avoid exception during construction of the wrapper objects
+        assertNull(searcher.getIndexReader().leaves().get(0).reader().getPointValues(null));
         Terms terms = searcher.getIndexReader().leaves().get(0).reader().terms(STRING_FIELD_NAME);
         TermsEnum termsIterator = terms.iterator();
         TermsEnum termsIntersect = terms.intersect(automaton, null);

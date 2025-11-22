@@ -226,6 +226,10 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
 
     private final BooleanSupplier idFieldDataEnabled;
 
+    private volatile Set<CompositeMappedFieldType> compositeMappedFieldTypes;
+    private volatile Set<String> fieldsPartOfCompositeMappings;
+    private volatile Set<String> nestedFieldsPartOfCompositeMappings;
+
     public MapperService(
         IndexSettings indexSettings,
         IndexAnalyzers indexAnalyzers,
@@ -237,6 +241,7 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
         ScriptService scriptService
     ) {
         super(indexSettings);
+
         this.indexVersionCreated = indexSettings.getIndexVersionCreated();
         this.indexAnalyzers = indexAnalyzers;
         this.documentParser = new DocumentMapperParser(
@@ -261,7 +266,12 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
         this.idFieldDataEnabled = idFieldDataEnabled;
 
         if (INDEX_MAPPER_DYNAMIC_SETTING.exists(indexSettings.getSettings())) {
-            throw new IllegalArgumentException("Setting " + INDEX_MAPPER_DYNAMIC_SETTING.getKey() + " was removed after version 6.0.0");
+            deprecationLogger.deprecate(
+                index().getName() + INDEX_MAPPER_DYNAMIC_SETTING.getKey(),
+                "Index [{}] has setting [{}] that is not supported in OpenSearch, its value will be ignored.",
+                index().getName(),
+                INDEX_MAPPER_DYNAMIC_SETTING.getKey()
+            );
         }
     }
 
@@ -536,7 +546,38 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
         }
 
         assert results.values().stream().allMatch(this::assertSerialization);
+
+        // initialize composite fields post merge
+        this.compositeMappedFieldTypes = getCompositeFieldTypesFromMapper();
+        buildCompositeFieldLookup();
         return results;
+    }
+
+    private void buildCompositeFieldLookup() {
+        Set<String> fieldsPartOfCompositeMappings = new HashSet<>();
+        Set<String> nestedFieldsPartOfCompositeMappings = new HashSet<>();
+
+        for (CompositeMappedFieldType fieldType : compositeMappedFieldTypes) {
+            fieldsPartOfCompositeMappings.addAll(fieldType.fields());
+
+            for (String field : fieldType.fields()) {
+                String[] parts = field.split("\\.");
+                if (parts.length > 1) {
+                    StringBuilder path = new StringBuilder();
+                    for (int i = 0; i < parts.length; i++) {
+                        if (i == 0) {
+                            path.append(parts[i]);
+                        } else {
+                            path.append(".").append(parts[i]);
+                        }
+                        nestedFieldsPartOfCompositeMappings.add(path.toString());
+                    }
+                }
+            }
+        }
+
+        this.fieldsPartOfCompositeMappings = fieldsPartOfCompositeMappings;
+        this.nestedFieldsPartOfCompositeMappings = nestedFieldsPartOfCompositeMappings;
     }
 
     private boolean assertSerialization(DocumentMapper mapper) {
@@ -644,6 +685,36 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
         return this.mapper == null ? Collections.emptySet() : this.mapper.fieldTypes();
     }
 
+    public boolean isCompositeIndexPresent() {
+        return this.mapper != null && !getCompositeFieldTypes().isEmpty();
+    }
+
+    public Set<CompositeMappedFieldType> getCompositeFieldTypes() {
+        return compositeMappedFieldTypes;
+    }
+
+    private Set<CompositeMappedFieldType> getCompositeFieldTypesFromMapper() {
+        Set<CompositeMappedFieldType> compositeMappedFieldTypes = new HashSet<>();
+        if (this.mapper == null) {
+            return Collections.emptySet();
+        }
+        for (MappedFieldType type : this.mapper.fieldTypes()) {
+            if (type != null && type.unwrap() instanceof CompositeMappedFieldType) {
+                compositeMappedFieldTypes.add((CompositeMappedFieldType) type);
+            }
+        }
+        return compositeMappedFieldTypes;
+    }
+
+    public boolean isFieldPartOfCompositeIndex(String field) {
+        return fieldsPartOfCompositeMappings.contains(field);
+    }
+
+    public boolean isCompositeIndexFieldNestedField(String field) {
+        return nestedFieldsPartOfCompositeMappings.contains(field);
+
+    }
+
     public ObjectMapper getObjectMapper(String name) {
         return this.mapper == null ? null : this.mapper.objectMappers().get(name);
     }
@@ -706,6 +777,13 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
      */
     public boolean isMetadataField(String field) {
         return mapperRegistry.isMetadataField(field);
+    }
+
+    /**
+     * Returns a set containing the registered metadata fields
+     */
+    public Set<String> getMetadataFields() {
+        return Collections.unmodifiableSet(mapperRegistry.getMetadataMapperParsers().keySet());
     }
 
     /**

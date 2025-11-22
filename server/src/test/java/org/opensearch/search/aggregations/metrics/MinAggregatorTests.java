@@ -51,7 +51,7 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.MultiReader;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.search.DocValuesFieldExistsQuery;
+import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
@@ -226,7 +226,7 @@ public class MinAggregatorTests extends AggregatorTestCase {
     }
 
     public void testSomeMatchesSortedNumericDocValues() throws IOException {
-        testCase(new DocValuesFieldExistsQuery("number"), iw -> {
+        testCase(new FieldExistsQuery("number"), iw -> {
             iw.addDocument(singleton(new SortedNumericDocValuesField("number", 7)));
             iw.addDocument(singleton(new SortedNumericDocValuesField("number2", 2)));
             iw.addDocument(singleton(new SortedNumericDocValuesField("number", 3)));
@@ -237,7 +237,7 @@ public class MinAggregatorTests extends AggregatorTestCase {
     }
 
     public void testSomeMatchesNumericDocValues() throws IOException {
-        testCase(new DocValuesFieldExistsQuery("number"), iw -> {
+        testCase(new FieldExistsQuery("number"), iw -> {
             iw.addDocument(singleton(new NumericDocValuesField("number", 7)));
             iw.addDocument(singleton(new NumericDocValuesField("number2", 2)));
             iw.addDocument(singleton(new NumericDocValuesField("number", 3)));
@@ -776,5 +776,63 @@ public class MinAggregatorTests extends AggregatorTestCase {
     @Override
     protected AggregationBuilder createAggBuilderForTypeTest(MappedFieldType fieldType, String fieldName) {
         return new MinAggregationBuilder("foo").field(fieldName);
+    }
+
+    public void testStreamingCostMetrics() throws IOException {
+        Directory directory = newDirectory();
+        RandomIndexWriter indexWriter = new RandomIndexWriter(random(), directory);
+        indexWriter.addDocument(singleton(new NumericDocValuesField("value", 1)));
+        indexWriter.close();
+
+        IndexReader indexReader = DirectoryReader.open(directory);
+        IndexSearcher indexSearcher = newSearcher(indexReader, true, true);
+
+        MappedFieldType fieldType = new NumberFieldMapper.NumberFieldType("value", NumberFieldMapper.NumberType.INTEGER);
+        MinAggregationBuilder aggregationBuilder = new MinAggregationBuilder("min").field("value");
+
+        MinAggregator aggregator = createAggregator(aggregationBuilder, indexSearcher, fieldType);
+
+        // Test streaming cost metrics
+        org.opensearch.search.streaming.StreamingCostMetrics metrics = aggregator.getStreamingCostMetrics();
+        assertNotNull(metrics);
+        assertTrue("MinAggregator should be streamable", metrics.streamable());
+        assertEquals(1, metrics.topNSize());
+        assertEquals(1, metrics.estimatedBucketCount());
+        assertEquals(1, metrics.segmentCount());
+        assertEquals(1, metrics.estimatedDocCount());
+
+        indexReader.close();
+        directory.close();
+    }
+
+    public void testDoReset() throws IOException {
+        Directory directory = newDirectory();
+        RandomIndexWriter indexWriter = new RandomIndexWriter(random(), directory);
+        indexWriter.addDocument(singleton(new NumericDocValuesField("value", 5)));
+        indexWriter.addDocument(singleton(new NumericDocValuesField("value", 10)));
+        indexWriter.close();
+
+        IndexReader indexReader = DirectoryReader.open(directory);
+        IndexSearcher indexSearcher = newSearcher(indexReader, true, true);
+
+        MappedFieldType fieldType = new NumberFieldMapper.NumberFieldType("value", NumberFieldMapper.NumberType.INTEGER);
+        MinAggregationBuilder aggregationBuilder = new MinAggregationBuilder("min").field("value");
+
+        MinAggregator aggregator = createAggregator(aggregationBuilder, indexSearcher, fieldType);
+
+        aggregator.preCollection();
+        indexSearcher.search(new MatchAllDocsQuery(), aggregator);
+        aggregator.postCollection();
+
+        InternalMin result1 = (InternalMin) aggregator.buildAggregation(0L);
+        assertEquals(5.0, result1.getValue(), 0);
+
+        aggregator.doReset();
+
+        InternalMin result2 = (InternalMin) aggregator.buildAggregation(0L);
+        assertEquals(Double.POSITIVE_INFINITY, result2.getValue(), 0);
+
+        indexReader.close();
+        directory.close();
     }
 }

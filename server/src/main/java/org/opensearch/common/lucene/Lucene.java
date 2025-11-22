@@ -91,7 +91,9 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.index.analysis.AnalyzerScope;
 import org.opensearch.index.analysis.NamedAnalyzer;
+import org.opensearch.index.codec.CriteriaBasedCodec;
 import org.opensearch.index.fielddata.IndexFieldData;
+import org.opensearch.index.fielddata.plain.NonPruningSortedSetOrdinalsIndexFieldData.NonPruningSortField;
 import org.opensearch.search.sort.SortedWiderNumericSortField;
 
 import java.io.IOException;
@@ -110,9 +112,10 @@ import java.util.Map;
  * @opensearch.internal
  */
 public class Lucene {
-    public static final String LATEST_CODEC = "Lucene99";
+    public static final String LATEST_CODEC = "Lucene103";
 
     public static final String SOFT_DELETES_FIELD = "__soft_deletes";
+    public static final String PARENT_FIELD = "__nested_parent";
 
     public static final NamedAnalyzer STANDARD_ANALYZER = new NamedAnalyzer("_standard", AnalyzerScope.GLOBAL, new StandardAnalyzer());
     public static final NamedAnalyzer KEYWORD_ANALYZER = new NamedAnalyzer("_keyword", AnalyzerScope.GLOBAL, new KeywordAnalyzer());
@@ -272,7 +275,7 @@ public class Lucene {
 
             @Override
             protected Object doBody(String segmentFileName) throws IOException {
-                try (IndexInput input = directory.openInput(segmentFileName, IOContext.READ)) {
+                try (IndexInput input = directory.openInput(segmentFileName, IOContext.READONCE)) {
                     CodecUtil.checksumEntireFile(input);
                 }
                 return null;
@@ -357,63 +360,38 @@ public class Lucene {
     public static FieldDoc readFieldDoc(StreamInput in) throws IOException {
         Comparable[] cFields = new Comparable[in.readVInt()];
         for (int j = 0; j < cFields.length; j++) {
-            byte type = in.readByte();
-            if (type == 0) {
-                cFields[j] = null;
-            } else if (type == 1) {
-                cFields[j] = in.readString();
-            } else if (type == 2) {
-                cFields[j] = in.readInt();
-            } else if (type == 3) {
-                cFields[j] = in.readLong();
-            } else if (type == 4) {
-                cFields[j] = in.readFloat();
-            } else if (type == 5) {
-                cFields[j] = in.readDouble();
-            } else if (type == 6) {
-                cFields[j] = in.readByte();
-            } else if (type == 7) {
-                cFields[j] = in.readShort();
-            } else if (type == 8) {
-                cFields[j] = in.readBoolean();
-            } else if (type == 9) {
-                cFields[j] = in.readBytesRef();
-            } else if (type == 10) {
-                cFields[j] = new BigInteger(in.readString());
-            } else {
-                throw new IOException("Can't match type [" + type + "]");
-            }
+            cFields[j] = readTypedValue(in);
         }
         return new FieldDoc(in.readVInt(), in.readFloat(), cFields);
     }
 
     public static Comparable readSortValue(StreamInput in) throws IOException {
+        return readTypedValue(in);
+    }
+
+    /**
+     * Reads a typed value from the stream based on a type byte prefix.
+     *
+     * @param in the input stream
+     * @return the deserialized Comparable value
+     * @throws IOException if reading fails or type is unknown
+     */
+    private static Comparable readTypedValue(StreamInput in) throws IOException {
         byte type = in.readByte();
-        if (type == 0) {
-            return null;
-        } else if (type == 1) {
-            return in.readString();
-        } else if (type == 2) {
-            return in.readInt();
-        } else if (type == 3) {
-            return in.readLong();
-        } else if (type == 4) {
-            return in.readFloat();
-        } else if (type == 5) {
-            return in.readDouble();
-        } else if (type == 6) {
-            return in.readByte();
-        } else if (type == 7) {
-            return in.readShort();
-        } else if (type == 8) {
-            return in.readBoolean();
-        } else if (type == 9) {
-            return in.readBytesRef();
-        } else if (type == 10) {
-            return new BigInteger(in.readString());
-        } else {
-            throw new IOException("Can't match type [" + type + "]");
-        }
+        return switch (type) {
+            case 0 -> null;
+            case 1 -> in.readString();
+            case 2 -> in.readInt();
+            case 3 -> in.readLong();
+            case 4 -> in.readFloat();
+            case 5 -> in.readDouble();
+            case 6 -> in.readByte();
+            case 7 -> in.readShort();
+            case 8 -> in.readBoolean();
+            case 9 -> in.readBytesRef();
+            case 10 -> new BigInteger(in.readString());
+            default -> throw new IOException("Can't match type [" + type + "]");
+        };
     }
 
     public static ScoreDoc readScoreDoc(StreamInput in) throws IOException {
@@ -423,8 +401,8 @@ public class Lucene {
     private static final Class<?> GEO_DISTANCE_SORT_TYPE_CLASS = LatLonDocValuesField.newDistanceSort("some_geo_field", 0, 0).getClass();
 
     public static void writeTotalHits(StreamOutput out, TotalHits totalHits) throws IOException {
-        out.writeVLong(totalHits.value);
-        out.writeEnum(totalHits.relation);
+        out.writeVLong(totalHits.value());
+        out.writeEnum(totalHits.relation());
     }
 
     public static void writeTopDocs(StreamOutput out, TopDocsAndMaxScore topDocs) throws IOException {
@@ -600,6 +578,24 @@ public class Lucene {
             );
             newSortField.setMissingValue(sortField.getMissingValue());
             sortField = newSortField;
+        } else if (sortField instanceof NonPruningSortField) {
+            // There are 2 cases of how NonPruningSortField wraps around its underlying sort field.
+            // Which are through the SortField class or SortedSetSortField class
+            // We will serialize the sort field based on the type of underlying sort field
+            // Here the underlying sort field is SortedSetSortField, therefore, we will follow the
+            // logic in serializing SortedSetSortField and also unwrap the SortField case.
+            NonPruningSortField nonPruningSortField = (NonPruningSortField) sortField;
+            if (nonPruningSortField.getDelegate().getClass() == SortedSetSortField.class) {
+                SortField newSortField = new SortField(
+                    nonPruningSortField.getField(),
+                    SortField.Type.STRING,
+                    nonPruningSortField.getReverse()
+                );
+                newSortField.setMissingValue(nonPruningSortField.getMissingValue());
+                sortField = newSortField;
+            } else if (nonPruningSortField.getDelegate().getClass() == SortField.class) {
+                sortField = nonPruningSortField.getDelegate();
+            }
         }
 
         if (sortField.getClass() != SortField.class) {
@@ -944,9 +940,22 @@ public class Lucene {
                     // Two scenarios that we have hard-deletes: (1) from old segments where soft-deletes was disabled,
                     // (2) when IndexWriter hits non-aborted exceptions. These two cases, IW flushes SegmentInfos
                     // before exposing the hard-deletes, thus we can use the hard-delete count of SegmentInfos.
-                    final int numDocs = segmentReader.maxDoc() - segmentReader.getSegmentInfo().getDelCount();
+
+                    // With CAS enabled segments, hard deletes can also be present, so correcting numDocs.
+                    // We are using attribute value here to identify whether segment has CAS enabled or not.
+                    int numDocs;
+                    if (isContextAwareEnabled(segmentReader)) {
+                        numDocs = popCount(hardLiveDocs);
+                    } else {
+                        numDocs = segmentReader.maxDoc() - segmentReader.getSegmentInfo().getDelCount();
+                    }
+
                     assert numDocs == popCount(hardLiveDocs) : numDocs + " != " + popCount(hardLiveDocs);
                     return new LeafReaderWithLiveDocs(segmentReader, hardLiveDocs, numDocs);
+                }
+
+                private boolean isContextAwareEnabled(SegmentReader reader) {
+                    return reader.getSegmentInfo().info.getAttribute(CriteriaBasedCodec.BUCKET_NAME) != null;
                 }
             });
         }

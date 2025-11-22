@@ -80,7 +80,11 @@ import static org.mockito.Mockito.when;
 
 public abstract class MapperServiceTestCase extends OpenSearchTestCase {
 
-    protected static final Settings SETTINGS = Settings.builder().put("index.version.created", Version.CURRENT).build();
+    protected static final Settings SETTINGS = Settings.builder()
+        .put("index.version.created", Version.CURRENT)
+        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+        .build();
 
     protected static final ToXContent.Params INCLUDE_DEFAULTS = new ToXContent.MapParams(
         Collections.singletonMap("include_defaults", "true")
@@ -213,14 +217,37 @@ public abstract class MapperServiceTestCase extends OpenSearchTestCase {
         mapperService.merge("_doc", new CompressedXContent(BytesReference.bytes(mapping)), reason);
     }
 
-    protected final XContentBuilder topMapping(CheckedConsumer<XContentBuilder, IOException> buildFields) throws IOException {
+    protected final XContentBuilder topMapping(CheckedConsumer<XContentBuilder, IOException> mapping) throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject().startObject("_doc");
-        buildFields.accept(builder);
+        mapping.accept(builder);
         return builder.endObject().endObject();
     }
 
     protected final XContentBuilder mapping(CheckedConsumer<XContentBuilder, IOException> buildFields) throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder().startObject().startObject("_doc").startObject("properties");
+        buildFields.accept(builder);
+        return builder.endObject().endObject().endObject();
+    }
+
+    protected final CheckedConsumer<XContentBuilder, IOException> properties(CheckedConsumer<XContentBuilder, IOException> buildFields)
+        throws IOException {
+        return builder -> {
+            builder.startObject("properties");
+            buildFields.accept(builder);
+            builder.endObject();
+        };
+    }
+
+    protected final CheckedConsumer<XContentBuilder, IOException> contextAwareGrouping(String field) throws IOException {
+        return builder -> {
+            builder.startObject("context_aware_grouping");
+            builder.startArray("fields").value(field).endArray();
+            builder.endObject();
+        };
+    }
+
+    protected final XContentBuilder derivedMapping(CheckedConsumer<XContentBuilder, IOException> buildFields) throws IOException {
+        XContentBuilder builder = XContentFactory.jsonBuilder().startObject().startObject("_doc").startObject("derived");
         buildFields.accept(builder);
         return builder.endObject().endObject().endObject();
     }
@@ -231,7 +258,20 @@ public abstract class MapperServiceTestCase extends OpenSearchTestCase {
         return builder.endObject();
     }
 
-    protected final XContentBuilder fieldMapping(CheckedConsumer<XContentBuilder, IOException> buildField) throws IOException {
+    protected XContentBuilder fieldMapping(CheckedConsumer<XContentBuilder, IOException> buildField) throws IOException {
+        return fieldMapping(buildField, false);
+    }
+
+    protected final XContentBuilder fieldMapping(CheckedConsumer<XContentBuilder, IOException> buildField, Boolean isDerived)
+        throws IOException {
+        if (isDerived) {
+            return derivedMapping(b -> {
+                b.startObject("field");
+                buildField.accept(b);
+                b.endObject();
+            });
+        }
+
         return mapping(b -> {
             b.startObject("field");
             buildField.accept(b);
@@ -247,13 +287,16 @@ public abstract class MapperServiceTestCase extends OpenSearchTestCase {
         when(queryShardContext.getSearchQuoteAnalyzer(any())).thenCallRealMethod();
         when(queryShardContext.getSearchAnalyzer(any())).thenCallRealMethod();
         when(queryShardContext.getIndexSettings()).thenReturn(mapperService.getIndexSettings());
+        when(queryShardContext.getObjectMapper(anyString())).thenAnswer(
+            inv -> mapperService.getObjectMapper(inv.getArguments()[0].toString())
+        );
         when(queryShardContext.simpleMatchToIndexNames(any())).thenAnswer(
             inv -> mapperService.simpleMatchToFullName(inv.getArguments()[0].toString())
         );
         when(queryShardContext.allowExpensiveQueries()).thenReturn(true);
         when(queryShardContext.lookup()).thenReturn(new SearchLookup(mapperService, (ft, s) -> {
             throw new UnsupportedOperationException("search lookup not available");
-        }));
+        }, SearchLookup.UNKNOWN_SHARD_ID));
         when(queryShardContext.getFieldType(any())).thenAnswer(inv -> mapperService.fieldType(inv.getArguments()[0].toString()));
         when(queryShardContext.documentMapper(anyString())).thenReturn(mapperService.documentMapper());
         return queryShardContext;

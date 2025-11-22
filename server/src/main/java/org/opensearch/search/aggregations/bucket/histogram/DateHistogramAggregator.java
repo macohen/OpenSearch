@@ -31,14 +31,27 @@
 
 package org.opensearch.search.aggregations.bucket.histogram;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
-import org.apache.lucene.search.CollectionTerminatedException;
+import org.apache.lucene.search.DocIdStream;
+import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.util.CollectionUtil;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.Rounding;
 import org.opensearch.common.lease.Releasables;
+import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
+import org.opensearch.index.compositeindex.datacube.DateDimension;
+import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
+import org.opensearch.index.compositeindex.datacube.startree.utils.date.DateTimeUnitAdapter;
+import org.opensearch.index.compositeindex.datacube.startree.utils.date.DateTimeUnitRounding;
+import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
+import org.opensearch.index.mapper.CompositeDataCubeFieldType;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.Aggregator;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -47,17 +60,29 @@ import org.opensearch.search.aggregations.CardinalityUpperBound;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.LeafBucketCollector;
 import org.opensearch.search.aggregations.LeafBucketCollectorBase;
+import org.opensearch.search.aggregations.StarTreeBucketCollector;
+import org.opensearch.search.aggregations.StarTreePreComputeCollector;
 import org.opensearch.search.aggregations.bucket.BucketsAggregator;
-import org.opensearch.search.aggregations.bucket.FastFilterRewriteHelper;
+import org.opensearch.search.aggregations.bucket.filterrewrite.DateHistogramAggregatorBridge;
+import org.opensearch.search.aggregations.bucket.filterrewrite.FilterRewriteOptimizationContext;
 import org.opensearch.search.aggregations.bucket.terms.LongKeyedBucketOrds;
 import org.opensearch.search.aggregations.support.ValuesSource;
 import org.opensearch.search.aggregations.support.ValuesSourceConfig;
 import org.opensearch.search.internal.SearchContext;
+import org.opensearch.search.startree.StarTreeQueryHelper;
+import org.opensearch.search.startree.filter.DimensionFilter;
+import org.opensearch.search.startree.filter.MatchAllFilter;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
+
+import static org.opensearch.search.aggregations.bucket.filterrewrite.DateHistogramAggregatorBridge.segmentMatchAll;
+import static org.opensearch.search.startree.StarTreeQueryHelper.getSupportedStarTree;
 
 /**
  * An aggregator for date values. Every date is rounded down using a configured
@@ -67,7 +92,9 @@ import java.util.function.BiConsumer;
  *
  * @opensearch.internal
  */
-class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAggregator {
+class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAggregator, StarTreePreComputeCollector {
+    private static final Logger logger = LogManager.getLogger(DateHistogramAggregator.class);
+
     private final ValuesSource.Numeric valuesSource;
     private final DocValueFormat formatter;
     private final Rounding rounding;
@@ -81,8 +108,18 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
     private final LongBounds extendedBounds;
     private final LongBounds hardBounds;
     private final LongKeyedBucketOrds bucketOrds;
+    private final String starTreeDateDimension;
+    private boolean starTreeDateRoundingRequired = true;
 
-    private final FastFilterRewriteHelper.FastFilterContext fastFilterContext;
+    private final FilterRewriteOptimizationContext filterRewriteOptimizationContext;
+    private final String fieldName;
+    private final boolean fieldIndexSort;
+
+    // Collector usage tracking fields
+    private int noOpCollectorsUsed;
+    private int singleValuedCollectorsUsed;
+    private int multiValuedCollectorsUsed;
+    private int skipListCollectorsUsed;
 
     DateHistogramAggregator(
         String name,
@@ -115,29 +152,45 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
 
         bucketOrds = LongKeyedBucketOrds.build(context.bigArrays(), cardinality);
 
-        fastFilterContext = new FastFilterRewriteHelper.FastFilterContext();
-        fastFilterContext.setAggregationType(
-            new FastFilterRewriteHelper.DateHistogramAggregationType(
-                valuesSourceConfig.fieldType(),
-                valuesSourceConfig.missing() != null,
-                valuesSourceConfig.script() != null
-            )
-        );
-        if (fastFilterContext.isRewriteable(parent, subAggregators.length)) {
-            fastFilterContext.buildFastFilter(context, this::computeBounds, x -> rounding, () -> preparedRounding);
-        }
-    }
-
-    private long[] computeBounds(final FastFilterRewriteHelper.DateHistogramAggregationType fieldContext) throws IOException {
-        final long[] bounds = FastFilterRewriteHelper.getAggregationBounds(context, fieldContext.getFieldType().name());
-        if (bounds != null) {
-            // Update min/max limit if user specified any hard bounds
-            if (hardBounds != null) {
-                bounds[0] = Math.max(bounds[0], hardBounds.getMin());
-                bounds[1] = Math.min(bounds[1], hardBounds.getMax() - 1); // hard bounds max is exclusive
+        DateHistogramAggregatorBridge bridge = new DateHistogramAggregatorBridge() {
+            @Override
+            protected boolean canOptimize() {
+                return canOptimize(valuesSourceConfig, rounding);
             }
-        }
-        return bounds;
+
+            @Override
+            protected void prepare() throws IOException {
+                buildRanges(context);
+            }
+
+            @Override
+            protected Rounding getRounding(long low, long high) {
+                return rounding;
+            }
+
+            @Override
+            protected Rounding.Prepared getRoundingPrepared() {
+                return preparedRounding;
+            }
+
+            @Override
+            protected long[] processHardBounds(long[] bounds) {
+                return super.processHardBounds(bounds, hardBounds);
+            }
+
+            @Override
+            protected Function<Long, Long> bucketOrdProducer() {
+                return (key) -> bucketOrds.add(0, preparedRounding.round((long) key));
+            }
+        };
+        filterRewriteOptimizationContext = new FilterRewriteOptimizationContext(bridge, parent, subAggregators.length, context);
+        this.fieldName = (valuesSource instanceof ValuesSource.Numeric.FieldData)
+            ? ((ValuesSource.Numeric.FieldData) valuesSource).getIndexFieldName()
+            : null;
+        this.fieldIndexSort = this.fieldName == null ? false : context.getQueryShardContext().indexSortedOnField(fieldName);
+        this.starTreeDateDimension = (context.getQueryShardContext().getStarTreeQueryContext() != null)
+            ? fetchStarTreeCalendarUnit()
+            : null;
     }
 
     @Override
@@ -149,28 +202,75 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
     }
 
     @Override
+    protected boolean tryPrecomputeAggregationForLeaf(LeafReaderContext ctx) throws IOException {
+        CompositeIndexFieldInfo supportedStarTree = getSupportedStarTree(this.context.getQueryShardContext());
+        if (supportedStarTree != null) {
+            StarTreeBucketCollector starTreeBucketCollector = getStarTreeBucketCollector(ctx, supportedStarTree, null);
+            StarTreeQueryHelper.preComputeBucketsWithStarTree(starTreeBucketCollector);
+            return true;
+        }
+
+        return filterRewriteOptimizationContext.tryOptimize(
+            ctx,
+            this::incrementBucketDocCount,
+            segmentMatchAll(context, ctx),
+            collectableSubAggregators
+        );
+    }
+
+    @Override
     public LeafBucketCollector getLeafCollector(LeafReaderContext ctx, LeafBucketCollector sub) throws IOException {
         if (valuesSource == null) {
+            noOpCollectorsUsed++;
             return LeafBucketCollector.NO_OP_COLLECTOR;
         }
 
-        boolean optimized = FastFilterRewriteHelper.tryFastFilterAggregation(
-            ctx,
-            fastFilterContext,
-            (key, count) -> incrementBucketDocCount(
-                FastFilterRewriteHelper.getBucketOrd(bucketOrds.add(0, preparedRounding.round(key))),
-                count
-            )
-        );
-        if (optimized) throw new CollectionTerminatedException();
+        DocValuesSkipper skipper = null;
+        if (this.fieldName != null) {
+            skipper = ctx.reader().getDocValuesSkipper(this.fieldName);
+        }
+        final SortedNumericDocValues values = valuesSource.longValues(ctx);
+        final NumericDocValues singleton = DocValues.unwrapSingleton(values);
 
-        SortedNumericDocValues values = valuesSource.longValues(ctx);
+        if (skipper != null && singleton != null) {
+            // TODO: add hard bounds support
+            if (hardBounds == null && parent == null) {
+                skipListCollectorsUsed++;
+                return new HistogramSkiplistLeafCollector(singleton, skipper, preparedRounding, bucketOrds, sub, this);
+            }
+        }
+
+        if (singleton != null) {
+            // Optimized path for single-valued fields
+            singleValuedCollectorsUsed++;
+            return new LeafBucketCollectorBase(sub, values) {
+                @Override
+                public void collect(int doc, long owningBucketOrd) throws IOException {
+                    if (singleton.advanceExact(doc)) {
+                        long value = singleton.longValue();
+                        collectValue(sub, doc, owningBucketOrd, preparedRounding.round(value));
+                    }
+                }
+
+                @Override
+                public void collect(DocIdStream stream, long owningBucketOrd) throws IOException {
+                    super.collect(stream, owningBucketOrd);
+                }
+
+                @Override
+                public void collectRange(int min, int max) throws IOException {
+                    super.collectRange(min, max);
+                }
+            };
+        }
+
+        // Original path for multi-valued fields
+        multiValuedCollectorsUsed++;
         return new LeafBucketCollectorBase(sub, values) {
             @Override
             public void collect(int doc, long owningBucketOrd) throws IOException {
                 if (values.advanceExact(doc)) {
                     int valuesCount = values.docValueCount();
-
                     long previousRounded = Long.MIN_VALUE;
                     for (int i = 0; i < valuesCount; ++i) {
                         long value = values.nextValue();
@@ -179,16 +279,103 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
                         if (rounded == previousRounded) {
                             continue;
                         }
-                        if (hardBounds == null || hardBounds.contain(rounded)) {
-                            long bucketOrd = bucketOrds.add(owningBucketOrd, rounded);
-                            if (bucketOrd < 0) { // already seen
-                                bucketOrd = -1 - bucketOrd;
-                                collectExistingBucket(sub, doc, bucketOrd);
-                            } else {
-                                collectBucket(sub, doc, bucketOrd);
-                            }
-                        }
+                        collectValue(sub, doc, owningBucketOrd, rounded);
                         previousRounded = rounded;
+                    }
+                }
+            }
+
+            @Override
+            public void collect(DocIdStream stream, long owningBucketOrd) throws IOException {
+                super.collect(stream, owningBucketOrd);
+            }
+
+            @Override
+            public void collectRange(int min, int max) throws IOException {
+                super.collectRange(min, max);
+            }
+        };
+    }
+
+    private void collectValue(LeafBucketCollector sub, int doc, long owningBucketOrd, long rounded) throws IOException {
+        if (hardBounds == null || hardBounds.contain(rounded)) {
+            long bucketOrd = bucketOrds.add(owningBucketOrd, rounded);
+            if (bucketOrd < 0) { // already seen
+                bucketOrd = -1 - bucketOrd;
+                collectExistingBucket(sub, doc, bucketOrd);
+            } else {
+                collectBucket(sub, doc, bucketOrd);
+            }
+        }
+    }
+
+    private String fetchStarTreeCalendarUnit() {
+        if (this.rounding.unit() == null) {
+            return null;
+        }
+
+        CompositeDataCubeFieldType compositeMappedFieldType = (CompositeDataCubeFieldType) context.mapperService()
+            .getCompositeFieldTypes()
+            .iterator()
+            .next();
+        DateDimension starTreeDateDimension = (DateDimension) compositeMappedFieldType.getDimensions()
+            .stream()
+            .filter(dim -> dim.getField().equals(fieldName))
+            .findFirst() // Get the first matching time dimension
+            .orElseThrow(() -> new AssertionError(String.format(Locale.ROOT, "Date dimension '%s' not found", fieldName)));
+
+        DateTimeUnitAdapter dateTimeUnitRounding = new DateTimeUnitAdapter(this.rounding.unit());
+        DateTimeUnitRounding rounding = starTreeDateDimension.findClosestValidInterval(dateTimeUnitRounding);
+        String dimensionName = fieldName + "_" + rounding.shortName();
+        if (rounding.shortName().equals(this.rounding.unit().shortName())) {
+            this.starTreeDateRoundingRequired = false;
+        }
+        return dimensionName;
+    }
+
+    @Override
+    public List<DimensionFilter> getDimensionFilters() {
+        return StarTreeQueryHelper.collectDimensionFilters(new MatchAllFilter(fieldName, starTreeDateDimension), subAggregators);
+    }
+
+    @Override
+    public StarTreeBucketCollector getStarTreeBucketCollector(
+        LeafReaderContext ctx,
+        CompositeIndexFieldInfo starTree,
+        StarTreeBucketCollector parentCollector
+    ) throws IOException {
+        StarTreeValues starTreeValues = StarTreeQueryHelper.getStarTreeValues(ctx, starTree);
+        SortedNumericStarTreeValuesIterator valuesIterator = (SortedNumericStarTreeValuesIterator) starTreeValues
+            .getDimensionValuesIterator(starTreeDateDimension);
+        SortedNumericStarTreeValuesIterator docCountsIterator = StarTreeQueryHelper.getDocCountsIterator(starTreeValues, starTree);
+        return new StarTreeBucketCollector(
+            starTreeValues,
+            parentCollector == null ? StarTreeQueryHelper.getStarTreeResult(starTreeValues, context, getDimensionFilters()) : null
+        ) {
+            @Override
+            public void setSubCollectors() throws IOException {
+                for (Aggregator aggregator : subAggregators) {
+                    this.subCollectors.add(
+                        ((StarTreePreComputeCollector) aggregator.unwrapAggregator()).getStarTreeBucketCollector(ctx, starTree, this)
+                    );
+                }
+            }
+
+            @Override
+            public void collectStarTreeEntry(int starTreeEntry, long owningBucketOrd) throws IOException {
+                if (!valuesIterator.advanceExact(starTreeEntry)) {
+                    return;
+                }
+
+                for (int i = 0, count = valuesIterator.entryValueCount(); i < count; i++) {
+                    long dimensionValue = starTreeDateRoundingRequired
+                        ? preparedRounding.round(valuesIterator.nextValue())
+                        : valuesIterator.nextValue();
+
+                    if (docCountsIterator.advanceExact(starTreeEntry)) {
+                        long metricValue = docCountsIterator.nextValue();
+                        long bucketOrd = bucketOrds.add(owningBucketOrd, dimensionValue);
+                        collectStarTreeBucket(this, metricValue, bucketOrd, starTreeEntry);
                     }
                 }
             }
@@ -247,7 +434,13 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
 
     @Override
     public void collectDebugInfo(BiConsumer<String, Object> add) {
+        super.collectDebugInfo(add);
         add.accept("total_buckets", bucketOrds.size());
+        filterRewriteOptimizationContext.populateDebugInfo(add);
+        add.accept("no_op_collectors_used", noOpCollectorsUsed);
+        add.accept("single_valued_collectors_used", singleValuedCollectorsUsed);
+        add.accept("multi_valued_collectors_used", multiValuedCollectorsUsed);
+        add.accept("skip_list_collectors_used", skipListCollectorsUsed);
     }
 
     /**
@@ -260,5 +453,150 @@ class DateHistogramAggregator extends BucketsAggregator implements SizedBucketAg
         } else {
             return 1.0;
         }
+    }
+
+    private static class HistogramSkiplistLeafCollector extends LeafBucketCollector {
+
+        private final NumericDocValues values;
+        private final DocValuesSkipper skipper;
+        private final Rounding.Prepared preparedRounding;
+        private final LongKeyedBucketOrds bucketOrds;
+        private final LeafBucketCollector sub;
+        private final BucketsAggregator aggregator;
+
+        /**
+         * Max doc ID (inclusive) up to which all docs values may map to the same bucket.
+         */
+        private int upToInclusive = -1;
+
+        /**
+         * Whether all docs up to {@link #upToInclusive} values map to the same bucket.
+         */
+        private boolean upToSameBucket;
+
+        /**
+         * Index in bucketOrds for docs up to {@link #upToInclusive}.
+         */
+        private long upToBucketIndex;
+
+        HistogramSkiplistLeafCollector(
+            NumericDocValues values,
+            DocValuesSkipper skipper,
+            Rounding.Prepared preparedRounding,
+            LongKeyedBucketOrds bucketOrds,
+            LeafBucketCollector sub,
+            BucketsAggregator aggregator
+        ) {
+            this.values = values;
+            this.skipper = skipper;
+            this.preparedRounding = preparedRounding;
+            this.bucketOrds = bucketOrds;
+            this.sub = sub;
+            this.aggregator = aggregator;
+        }
+
+        @Override
+        public void setScorer(Scorable scorer) throws IOException {
+            if (sub != null) {
+                sub.setScorer(scorer);
+            }
+        }
+
+        private void advanceSkipper(int doc, long owningBucketOrd) throws IOException {
+            if (doc > skipper.maxDocID(0)) {
+                skipper.advance(doc);
+            }
+            upToSameBucket = false;
+
+            if (skipper.minDocID(0) > doc) {
+                // Corner case which happens if `doc` doesn't have a value and is between two intervals of
+                // the doc-value skip index.
+                upToInclusive = skipper.minDocID(0) - 1;
+                return;
+            }
+
+            upToInclusive = skipper.maxDocID(0);
+
+            // Now find the highest level where all docs map to the same bucket.
+            for (int level = 0; level < skipper.numLevels(); ++level) {
+                int totalDocsAtLevel = skipper.maxDocID(level) - skipper.minDocID(level) + 1;
+                long minBucket = preparedRounding.round(skipper.minValue(level));
+                long maxBucket = preparedRounding.round(skipper.maxValue(level));
+
+                if (skipper.docCount(level) == totalDocsAtLevel && minBucket == maxBucket) {
+                    // All docs at this level have a value, and all values map to the same bucket.
+                    upToInclusive = skipper.maxDocID(level);
+                    upToSameBucket = true;
+                    upToBucketIndex = bucketOrds.add(owningBucketOrd, maxBucket);
+                    if (upToBucketIndex < 0) {
+                        upToBucketIndex = -1 - upToBucketIndex;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        @Override
+        public void collect(int doc, long owningBucketOrd) throws IOException {
+            if (doc > upToInclusive) {
+                advanceSkipper(doc, owningBucketOrd);
+            }
+
+            if (upToSameBucket) {
+                aggregator.incrementBucketDocCount(upToBucketIndex, 1L);
+                sub.collect(doc, upToBucketIndex);
+            } else if (values.advanceExact(doc)) {
+                final long value = values.longValue();
+                long bucketIndex = bucketOrds.add(owningBucketOrd, preparedRounding.round(value));
+                if (bucketIndex < 0) {
+                    bucketIndex = -1 - bucketIndex;
+                    aggregator.collectExistingBucket(sub, doc, bucketIndex);
+                } else {
+                    aggregator.collectBucket(sub, doc, bucketIndex);
+                }
+            }
+        }
+
+        @Override
+        public void collect(int doc) throws IOException {
+            collect(doc, 0);
+        }
+
+        @Override
+        public void collect(DocIdStream stream) throws IOException {
+            // This will only be called if its the top agg
+            for (;;) {
+                int upToExclusive = upToInclusive + 1;
+                if (upToExclusive < 0) { // overflow
+                    upToExclusive = Integer.MAX_VALUE;
+                }
+
+                if (upToSameBucket) {
+                    if (sub == NO_OP_COLLECTOR) {
+                        // stream.count maybe faster when we don't need to handle sub-aggs
+                        long count = stream.count(upToExclusive);
+                        aggregator.incrementBucketDocCount(upToBucketIndex, count);
+                    } else {
+                        final int[] count = { 0 };
+                        stream.forEach(upToExclusive, doc -> {
+                            sub.collect(doc, upToBucketIndex);
+                            count[0]++;
+                        });
+                        aggregator.incrementBucketDocCount(upToBucketIndex, count[0]);
+                    }
+
+                } else {
+                    stream.forEach(upToExclusive, this::collect);
+                }
+
+                if (stream.mayHaveRemaining()) {
+                    advanceSkipper(upToExclusive, 0);
+                } else {
+                    break;
+                }
+            }
+        }
+
     }
 }

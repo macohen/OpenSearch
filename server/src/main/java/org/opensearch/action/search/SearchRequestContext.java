@@ -8,13 +8,22 @@
 
 package org.opensearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.search.TotalHits;
 import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.tasks.resourcetracker.TaskResourceInfo;
 
+import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.function.Supplier;
 
 /**
  * This class holds request-level context for search queries at the coordinator node
@@ -22,21 +31,31 @@ import java.util.Map;
  * @opensearch.internal
  */
 @InternalApi
-class SearchRequestContext {
+public class SearchRequestContext {
+    private static final Logger logger = LogManager.getLogger();
     private final SearchRequestOperationsListener searchRequestOperationsListener;
     private long absoluteStartNanos;
     private final Map<String, Long> phaseTookMap;
     private TotalHits totalHits;
     private final EnumMap<ShardStatsFieldNames, Integer> shardStats;
+    private Set<Index> successfulSearchShardIndices;
 
     private final SearchRequest searchRequest;
+    private final LinkedBlockingQueue<TaskResourceInfo> phaseResourceUsage;
+    private final Supplier<TaskResourceInfo> taskResourceUsageSupplier;
 
-    SearchRequestContext(final SearchRequestOperationsListener searchRequestOperationsListener, final SearchRequest searchRequest) {
+    SearchRequestContext(
+        final SearchRequestOperationsListener searchRequestOperationsListener,
+        final SearchRequest searchRequest,
+        final Supplier<TaskResourceInfo> taskResourceUsageSupplier
+    ) {
         this.searchRequestOperationsListener = searchRequestOperationsListener;
         this.absoluteStartNanos = System.nanoTime();
         this.phaseTookMap = new HashMap<>();
         this.shardStats = new EnumMap<>(ShardStatsFieldNames.class);
         this.searchRequest = searchRequest;
+        this.phaseResourceUsage = new LinkedBlockingQueue<>();
+        this.taskResourceUsageSupplier = taskResourceUsageSupplier;
     }
 
     SearchRequestOperationsListener getSearchRequestOperationsListener() {
@@ -47,7 +66,7 @@ class SearchRequestContext {
         this.phaseTookMap.put(phaseName, tookTime);
     }
 
-    Map<String, Long> phaseTookMap() {
+    public Map<String, Long> phaseTookMap() {
         return phaseTookMap;
     }
 
@@ -70,7 +89,7 @@ class SearchRequestContext {
     /**
      * Request start time in nanos
      */
-    long getAbsoluteStartNanos() {
+    public long getAbsoluteStartNanos() {
         return absoluteStartNanos;
     }
 
@@ -78,7 +97,7 @@ class SearchRequestContext {
         this.totalHits = totalHits;
     }
 
-    TotalHits totalHits() {
+    public TotalHits totalHits() {
         return totalHits;
     }
 
@@ -106,6 +125,36 @@ class SearchRequestContext {
                 shardStats.get(ShardStatsFieldNames.SEARCH_REQUEST_SLOWLOG_SHARD_FAILED)
             );
         }
+    }
+
+    public Supplier<TaskResourceInfo> getTaskResourceUsageSupplier() {
+        return taskResourceUsageSupplier;
+    }
+
+    public void recordPhaseResourceUsage(TaskResourceInfo usage) {
+        if (usage != null) {
+            this.phaseResourceUsage.add(usage);
+        }
+    }
+
+    public List<TaskResourceInfo> getPhaseResourceUsage() {
+        return new ArrayList<>(phaseResourceUsage);
+    }
+
+    public SearchRequest getRequest() {
+        return searchRequest;
+    }
+
+    void setSuccessfulSearchShardIndices(Set<Index> successfulSearchShardIndices) {
+        this.successfulSearchShardIndices = successfulSearchShardIndices;
+    }
+
+    /**
+     * @return A {@link Set} of {@link Index} representing the names of the indices that were
+     * successfully queried at the shard level.
+     */
+    public Set<Index> getSuccessfulSearchShardIndices() {
+        return successfulSearchShardIndices;
     }
 }
 

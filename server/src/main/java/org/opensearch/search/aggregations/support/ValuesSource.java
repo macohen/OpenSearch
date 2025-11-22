@@ -80,6 +80,7 @@ import java.util.function.LongUnaryOperator;
  */
 @PublicApi(since = "1.0.0")
 public abstract class ValuesSource {
+    private Runnable cancellationCheck;
 
     /**
      * Get the current {@link BytesValues}.
@@ -101,11 +102,19 @@ public abstract class ValuesSource {
      */
     public abstract Function<Rounding, Rounding.Prepared> roundingPreparer(IndexReader reader) throws IOException;
 
+    protected void setCancellationCheck(Runnable cancellationCheck) {
+        this.cancellationCheck = cancellationCheck;
+    }
+
     /**
      * Check if this values source supports using global ordinals
      */
     public boolean hasGlobalOrdinals() {
         return false;
+    }
+
+    public String getIndexFieldName() {
+        return null;
     }
 
     /**
@@ -245,6 +254,11 @@ public abstract class ValuesSource {
                 }
 
                 @Override
+                public String getIndexFieldName() {
+                    return this.indexFieldData.getFieldName();
+                }
+
+                @Override
                 public SortedBinaryDocValues bytesValues(LeafReaderContext context) {
                     final LeafOrdinalsFieldData atomicFieldData = indexFieldData.load(context);
                     return atomicFieldData.getBytesValues();
@@ -298,6 +312,11 @@ public abstract class ValuesSource {
             @Override
             public SortedBinaryDocValues bytesValues(LeafReaderContext context) {
                 return indexFieldData.load(context).getBytesValues();
+            }
+
+            @Override
+            public String getIndexFieldName() {
+                return this.indexFieldData.getFieldName();
             }
 
         }
@@ -576,6 +595,11 @@ public abstract class ValuesSource {
                     }
                     return false;
                 }
+
+                @Override
+                public int advance(int target) throws IOException {
+                    return doubleValues.advance(target);
+                }
             }
         }
 
@@ -615,6 +639,11 @@ public abstract class ValuesSource {
             @Override
             public SortedNumericDoubleValues doubleValues(LeafReaderContext context) {
                 return indexFieldData.load(context).getDoubleValues();
+            }
+
+            @Override
+            public String getIndexFieldName() {
+                return indexFieldData.getFieldName();
             }
         }
 

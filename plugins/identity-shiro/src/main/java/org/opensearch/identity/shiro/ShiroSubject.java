@@ -9,6 +9,7 @@
 package org.opensearch.identity.shiro;
 
 import org.opensearch.identity.Subject;
+import org.opensearch.identity.UserSubject;
 import org.opensearch.identity.tokens.AuthToken;
 
 import java.security.Principal;
@@ -16,10 +17,8 @@ import java.util.Objects;
 
 /**
  * Subject backed by Shiro
- *
- * @opensearch.experimental
  */
-public class ShiroSubject implements Subject {
+public class ShiroSubject implements UserSubject {
     private final ShiroTokenManager authTokenHandler;
     private final org.apache.shiro.subject.Subject shiroSubject;
 
@@ -43,7 +42,7 @@ public class ShiroSubject implements Subject {
     public Principal getPrincipal() {
         final Object o = shiroSubject.getPrincipal();
         if (o == null) return null;
-        if (o instanceof Principal) return (Principal) o;
+        if (o instanceof Principal principal) return principal;
         return () -> o.toString();
     }
 

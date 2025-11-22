@@ -42,7 +42,6 @@ import org.apache.lucene.util.BytesRef;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.document.DocumentField;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.core.common.ParsingException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -67,10 +66,10 @@ import java.util.Map;
 import java.util.Objects;
 
 import static java.util.Collections.singletonList;
-import static org.opensearch.client.Requests.indexRequest;
 import static org.opensearch.common.xcontent.XContentFactory.jsonBuilder;
 import static org.opensearch.search.SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING;
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertSearchResponse;
+import static org.opensearch.transport.client.Requests.indexRequest;
 import static org.hamcrest.CoreMatchers.equalTo;
 
 @ClusterScope(scope = Scope.SUITE, supportsDedicatedMasters = false, numDataNodes = 2)
@@ -86,11 +85,6 @@ public class FetchSubPhasePluginIT extends ParameterizedStaticSettingsOpenSearch
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     @Override
@@ -182,7 +176,7 @@ public class FetchSubPhasePluginIT extends ParameterizedStaticSettingsOpenSearch
                 hitField = new DocumentField(NAME, new ArrayList<>(1));
                 hitContext.hit().setDocumentField(NAME, hitField);
             }
-            Terms terms = hitContext.reader().getTermVector(hitContext.docId(), field);
+            Terms terms = hitContext.reader().termVectors().get(hitContext.docId(), field);
             if (terms != null) {
                 TermsEnum te = terms.iterator();
                 Map<String, Integer> tv = new HashMap<>();

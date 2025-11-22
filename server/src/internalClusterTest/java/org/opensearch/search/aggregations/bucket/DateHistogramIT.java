@@ -41,7 +41,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
 import org.opensearch.common.time.DateMathParser;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.index.query.MatchNoneQueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
@@ -118,11 +117,6 @@ public class DateHistogramIT extends ParameterizedStaticSettingsOpenSearchIntegT
         );
     }
 
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
     private ZonedDateTime date(String date) {
         return DateFormatters.from(DateFieldMapper.getDefaultDateTimeFormatter().parse(date));
     }
@@ -183,9 +177,9 @@ public class DateHistogramIT extends ParameterizedStaticSettingsOpenSearchIntegT
                 indexDoc(2, 15, 3), // date: Feb 15, dates: Feb 15, Mar 16
                 indexDoc(3, 2, 4),  // date: Mar 2, dates: Mar 2, Apr 3
                 indexDoc(3, 15, 5), // date: Mar 15, dates: Mar 15, Apr 16
-                indexDoc(3, 23, 6)
+                indexDoc(3, 23, 6)  // date: Mar 23, dates: Mar 23, Apr 24
             )
-        ); // date: Mar 23, dates: Mar 23, Apr 24
+        );
         indexRandom(true, builders);
         ensureSearchable();
     }
@@ -1037,7 +1031,7 @@ public class DateHistogramIT extends ParameterizedStaticSettingsOpenSearchIntegT
             )
             .get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(2L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(2L));
         Histogram histo = searchResponse.getAggregations().get("histo");
         assertThat(histo, Matchers.notNullValue());
         List<? extends Histogram.Bucket> buckets = histo.getBuckets();
@@ -1076,7 +1070,7 @@ public class DateHistogramIT extends ParameterizedStaticSettingsOpenSearchIntegT
             )
             .get();
 
-        assertThat(response.getHits().getTotalHits().value, equalTo(5L));
+        assertThat(response.getHits().getTotalHits().value(), equalTo(5L));
 
         Histogram histo = response.getAggregations().get("date_histo");
         List<? extends Histogram.Bucket> buckets = histo.getBuckets();
@@ -1247,7 +1241,7 @@ public class DateHistogramIT extends ParameterizedStaticSettingsOpenSearchIntegT
 
         assertThat(
             "Expected 24 buckets for one day aggregation with hourly interval",
-            response.getHits().getTotalHits().value,
+            response.getHits().getTotalHits().value(),
             equalTo(2L)
         );
 

@@ -47,6 +47,8 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.ChannelActionListener;
+import org.opensearch.action.support.TransportIndicesResolvingAction;
+import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.support.replication.ReplicationMode;
 import org.opensearch.action.support.replication.ReplicationOperation;
 import org.opensearch.action.support.replication.ReplicationTask;
@@ -55,13 +57,13 @@ import org.opensearch.action.support.replication.TransportWriteAction;
 import org.opensearch.action.update.UpdateHelper;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
-import org.opensearch.client.transport.NoNodeAvailableException;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.AllocationId;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -85,6 +87,7 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.index.IndexingPressureService;
 import org.opensearch.index.SegmentReplicationPressureService;
 import org.opensearch.index.engine.Engine;
+import org.opensearch.index.engine.LookupMapLockAcquisitionException;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.index.mapper.MapperException;
@@ -107,6 +110,7 @@ import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.transport.NoNodeAvailableException;
 
 import java.io.IOException;
 import java.util.Locale;
@@ -122,7 +126,9 @@ import java.util.function.LongSupplier;
  *
  * @opensearch.internal
  */
-public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequest, BulkShardRequest, BulkShardResponse> {
+public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequest, BulkShardRequest, BulkShardResponse>
+    implements
+        TransportIndicesResolvingAction<BulkShardRequest> {
 
     public static final String ACTION_NAME = BulkAction.NAME + "[s]";
 
@@ -215,6 +221,11 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
         } catch (RuntimeException e) {
             listener.onFailure(e);
         }
+    }
+
+    @Override
+    public ResolvedIndices resolveIndices(BulkShardRequest request) {
+        return ResolvedIndices.of(request.index());
     }
 
     /**
@@ -442,7 +453,7 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
 
     @Override
     public ReplicationMode getReplicationMode(IndexShard indexShard) {
-        if (indexShard.isRemoteTranslogEnabled()) {
+        if (indexShard.indexSettings().isAssignedOnRemoteNode()) {
             return ReplicationMode.PRIMARY_TERM_VALIDATION;
         }
         return super.getReplicationMode(indexShard);
@@ -520,12 +531,32 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
             }
 
             private void finishRequest() {
+                // If no actual writes occurred (locationToSync is null), we should not trigger refresh
+                // even if the request has RefreshPolicy.IMMEDIATE
+                final Translog.Location locationToSync = context.getLocationToSync();
+                final BulkShardRequest bulkShardRequest = context.getBulkShardRequest();
+
+                // Create a modified request with NONE refresh policy if no writes occurred
+                final BulkShardRequest requestForResult;
+                if (locationToSync == null && bulkShardRequest.getRefreshPolicy() != WriteRequest.RefreshPolicy.NONE) {
+                    // No actual writes occurred, so we should not refresh
+                    requestForResult = new BulkShardRequest(
+                        bulkShardRequest.shardId(),
+                        WriteRequest.RefreshPolicy.NONE,
+                        bulkShardRequest.items()
+                    );
+                    requestForResult.index(bulkShardRequest.index());
+                    requestForResult.setParentTask(bulkShardRequest.getParentTask());
+                } else {
+                    requestForResult = bulkShardRequest;
+                }
+
                 ActionListener.completeWith(
                     listener,
                     () -> new WritePrimaryResult<>(
-                        context.getBulkShardRequest(),
+                        requestForResult,
                         context.buildShardResponse(),
-                        context.getLocationToSync(),
+                        locationToSync,
                         null,
                         context.getPrimary(),
                         logger
@@ -697,7 +728,15 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
             && context.getRetryCounter() < ((UpdateRequest) docWriteRequest).retryOnConflict()) {
             context.resetForExecutionForRetry();
             return;
-        }
+        } else if (isFailed
+            && context.getPrimary() != null
+            && context.getPrimary().indexSettings() != null
+            && context.getPrimary().indexSettings().isContextAwareEnabled()
+            && isLookupMapLockAcquisitionException(executionResult.getFailure().getCause())
+            && context.getRetryCounter() < context.getPrimary().indexSettings().getMaxRetryOnLookupMapAcquisitionException()) {
+                context.resetForExecutionForRetry();
+                return;
+            }
         final BulkItemResponse response;
         if (isUpdate) {
             response = processUpdateResponse((UpdateRequest) docWriteRequest, context.getConcreteIndex(), executionResult, updateResult);
@@ -724,6 +763,10 @@ public class TransportShardBulkAction extends TransportWriteAction<BulkShardRequ
 
     private static boolean isConflictException(final Exception e) {
         return ExceptionsHelper.unwrapCause(e) instanceof VersionConflictEngineException;
+    }
+
+    private static boolean isLookupMapLockAcquisitionException(final Exception e) {
+        return ExceptionsHelper.unwrapCause(e) instanceof LookupMapLockAcquisitionException;
     }
 
     /**

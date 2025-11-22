@@ -59,6 +59,7 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
     private static final String OPENSEARCH_PACKAGE = "org.opensearch";
 
     private final Set<Element> reported = new HashSet<>();
+    private final Set<Element> validated = new HashSet<>();
     private final Set<AnnotatedConstruct> processed = new HashSet<>();
     private Kind reportFailureAs = Kind.ERROR;
 
@@ -85,6 +86,8 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
         );
 
         for (var element : elements) {
+            validate(element);
+
             if (!checkPackage(element)) {
                 continue;
             }
@@ -92,12 +95,70 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
             // Skip all not-public elements
             checkPublicVisibility(null, element);
 
-            if (element instanceof TypeElement) {
-                process((TypeElement) element);
+            if (element instanceof TypeElement typeElement) {
+                process(typeElement);
             }
         }
 
         return false;
+    }
+
+    private void validate(Element element) {
+        // The element was validated already
+        if (validated.contains(element)) {
+            return;
+        }
+
+        validated.add(element);
+
+        final PublicApi publicApi = element.getAnnotation(PublicApi.class);
+        if (publicApi != null) {
+            if (!validateVersion(publicApi.since())) {
+                processingEnv.getMessager()
+                    .printMessage(
+                        reportFailureAs,
+                        "The type " + element + " has @PublicApi annotation with unparseable OpenSearch version: " + publicApi.since()
+                    );
+            }
+        }
+
+        final DeprecatedApi deprecatedApi = element.getAnnotation(DeprecatedApi.class);
+        if (deprecatedApi != null) {
+            if (!validateVersion(deprecatedApi.since())) {
+                processingEnv.getMessager()
+                    .printMessage(
+                        reportFailureAs,
+                        "The type "
+                            + element
+                            + " has @DeprecatedApi annotation with unparseable OpenSearch version: "
+                            + deprecatedApi.since()
+                    );
+            }
+        }
+    }
+
+    private boolean validateVersion(String version) {
+        String[] parts = version.split("[.-]");
+        if (parts.length < 3 || parts.length > 4) {
+            return false;
+        }
+
+        int major = Integer.parseInt(parts[0]);
+        if (major > 3 || major < 0) {
+            return false;
+        }
+
+        int minor = Integer.parseInt(parts[1]);
+        if (minor < 0) {
+            return false;
+        }
+
+        int patch = Integer.parseInt(parts[2]);
+        if (patch < 0) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
@@ -124,22 +185,22 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
 
         // Process method return types
         final TypeMirror returnType = executable.getReturnType();
-        if (returnType instanceof ReferenceType) {
-            process(executable, (ReferenceType) returnType);
+        if (returnType instanceof ReferenceType refType) {
+            process(executable, refType);
         }
 
         // Process method thrown types
         for (final TypeMirror thrownType : executable.getThrownTypes()) {
-            if (thrownType instanceof ReferenceType) {
-                process(executable, (ReferenceType) thrownType);
+            if (thrownType instanceof ReferenceType refType) {
+                process(executable, refType);
             }
         }
 
         // Process method type parameters
         for (final TypeParameterElement typeParameter : executable.getTypeParameters()) {
             for (final TypeMirror boundType : typeParameter.getBounds()) {
-                if (boundType instanceof ReferenceType) {
-                    process(executable, (ReferenceType) boundType);
+                if (boundType instanceof ReferenceType refType) {
+                    process(executable, refType);
                 }
             }
         }
@@ -147,8 +208,8 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
         // Process method arguments
         for (final VariableElement parameter : executable.getParameters()) {
             final TypeMirror parameterType = parameter.asType();
-            if (parameterType instanceof ReferenceType) {
-                process(executable, (ReferenceType) parameterType);
+            if (parameterType instanceof ReferenceType refType) {
+                process(executable, refType);
             }
         }
     }
@@ -159,12 +220,12 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
      * @param type wildcard type
      */
     private void process(ExecutableElement executable, WildcardType type) {
-        if (type.getExtendsBound() instanceof ReferenceType) {
-            process(executable, (ReferenceType) type.getExtendsBound());
+        if (type.getExtendsBound() instanceof ReferenceType refType) {
+            process(executable, refType);
         }
 
-        if (type.getSuperBound() instanceof ReferenceType) {
-            process(executable, (ReferenceType) type.getSuperBound());
+        if (type.getSuperBound() instanceof ReferenceType refType) {
+            process(executable, refType);
         }
     }
 
@@ -179,8 +240,7 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
             return;
         }
 
-        if (ref instanceof DeclaredType) {
-            final DeclaredType declaredType = (DeclaredType) ref;
+        if (ref instanceof DeclaredType declaredType) {
 
             final Element element = declaredType.asElement();
             if (inspectable(element)) {
@@ -189,24 +249,23 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
             }
 
             for (final TypeMirror type : declaredType.getTypeArguments()) {
-                if (type instanceof ReferenceType) {
-                    process(executable, (ReferenceType) type);
-                } else if (type instanceof WildcardType) {
-                    process(executable, (WildcardType) type);
+                if (type instanceof ReferenceType refType) {
+                    process(executable, refType);
+                } else if (type instanceof WildcardType wildcardType) {
+                    process(executable, wildcardType);
                 }
             }
-        } else if (ref instanceof ArrayType) {
-            final TypeMirror componentType = ((ArrayType) ref).getComponentType();
-            if (componentType instanceof ReferenceType) {
-                process(executable, (ReferenceType) componentType);
+        } else if (ref instanceof ArrayType arrayType) {
+            final TypeMirror componentType = arrayType.getComponentType();
+            if (componentType instanceof ReferenceType refType) {
+                process(executable, refType);
             }
-        } else if (ref instanceof TypeVariable) {
-            final TypeVariable typeVariable = (TypeVariable) ref;
-            if (typeVariable.getUpperBound() instanceof ReferenceType) {
-                process(executable, (ReferenceType) typeVariable.getUpperBound());
+        } else if (ref instanceof TypeVariable typeVariable) {
+            if (typeVariable.getUpperBound() instanceof ReferenceType refType) {
+                process(executable, refType);
             }
-            if (typeVariable.getLowerBound() instanceof ReferenceType) {
-                process(executable, (ReferenceType) typeVariable.getLowerBound());
+            if (typeVariable.getLowerBound() instanceof ReferenceType refType) {
+                process(executable, refType);
             }
         }
 
@@ -287,8 +346,8 @@ public class ApiAnnotationProcessor extends AbstractProcessor {
                 continue;
             }
 
-            if (enclosed instanceof ExecutableElement) {
-                process((ExecutableElement) enclosed, element);
+            if (enclosed instanceof ExecutableElement executableElement) {
+                process(executableElement, element);
             }
         }
     }

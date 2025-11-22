@@ -40,7 +40,6 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchType;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.SearchHits;
@@ -73,11 +72,6 @@ public class DuelScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTest
         );
     }
 
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
     public void testDuelQueryThenFetch() throws Exception {
         TestContext context = create(SearchType.DFS_QUERY_THEN_FETCH, SearchType.QUERY_THEN_FETCH);
 
@@ -88,7 +82,7 @@ public class DuelScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTest
             .get();
         assertNoFailures(control);
         SearchHits sh = control.getHits();
-        assertThat(sh.getTotalHits().value, equalTo((long) context.numDocs));
+        assertThat(sh.getTotalHits().value(), equalTo((long) context.numDocs));
         assertThat(sh.getHits().length, equalTo(context.numDocs));
 
         SearchResponse searchScrollResponse = client().prepareSearch("index")
@@ -99,7 +93,7 @@ public class DuelScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTest
             .get();
 
         assertNoFailures(searchScrollResponse);
-        assertThat(searchScrollResponse.getHits().getTotalHits().value, equalTo((long) context.numDocs));
+        assertThat(searchScrollResponse.getHits().getTotalHits().value(), equalTo((long) context.numDocs));
         assertThat(searchScrollResponse.getHits().getHits().length, equalTo(context.scrollRequestSize));
 
         int counter = 0;
@@ -112,7 +106,7 @@ public class DuelScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTest
         while (true) {
             searchScrollResponse = client().prepareSearchScroll(scrollId).setScroll("10m").get();
             assertNoFailures(searchScrollResponse);
-            assertThat(searchScrollResponse.getHits().getTotalHits().value, equalTo((long) context.numDocs));
+            assertThat(searchScrollResponse.getHits().getTotalHits().value(), equalTo((long) context.numDocs));
             if (searchScrollResponse.getHits().getHits().length == 0) {
                 break;
             }
@@ -279,7 +273,7 @@ public class DuelScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTest
         try {
             while (true) {
                 assertNoFailures(scroll);
-                assertEquals(control.getHits().getTotalHits().value, scroll.getHits().getTotalHits().value);
+                assertEquals(control.getHits().getTotalHits().value(), scroll.getHits().getTotalHits().value());
                 assertEquals(control.getHits().getMaxScore(), scroll.getHits().getMaxScore(), 0.01f);
                 if (scroll.getHits().getHits().length == 0) {
                     break;
@@ -292,7 +286,7 @@ public class DuelScrollIT extends ParameterizedStaticSettingsOpenSearchIntegTest
                 scrollDocs += scroll.getHits().getHits().length;
                 scroll = client().prepareSearchScroll(scroll.getScrollId()).setScroll("10m").get();
             }
-            assertEquals(control.getHits().getTotalHits().value, scrollDocs);
+            assertEquals(control.getHits().getTotalHits().value(), scrollDocs);
         } catch (AssertionError e) {
             logger.info("Control:\n{}", control);
             logger.info("Scroll size={}, from={}:\n{}", size, scrollDocs, scroll);

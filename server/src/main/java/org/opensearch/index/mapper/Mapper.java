@@ -32,6 +32,7 @@
 
 package org.opensearch.index.mapper;
 
+import org.apache.lucene.index.LeafReader;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.Nullable;
@@ -39,11 +40,13 @@ import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.core.xcontent.ToXContentFragment;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.similarity.SimilarityProvider;
 import org.opensearch.script.ScriptService;
 
+import java.io.IOException;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
@@ -100,7 +103,7 @@ public abstract class Mapper implements ToXContentFragment, Iterable<Mapper> {
      * @opensearch.api
      */
     @PublicApi(since = "1.0.0")
-    public abstract static class Builder<T extends Builder> {
+    public abstract static class Builder<T extends Builder> implements MapperBuilderProperties {
 
         public String name;
 
@@ -253,6 +256,11 @@ public abstract class Mapper implements ToXContentFragment, Iterable<Mapper> {
         }
 
         Mapper.Builder<?> parse(String name, Map<String, Object> node, ParserContext parserContext) throws MapperParsingException;
+
+        default Mapper.Builder<?> parse(String name, Map<String, Object> node, ParserContext parserContext, ObjectMapper.Builder objBuilder)
+            throws MapperParsingException {
+            throw new UnsupportedOperationException("should not be invoked");
+        }
     }
 
     private final String simpleName;
@@ -293,5 +301,22 @@ public abstract class Mapper implements ToXContentFragment, Iterable<Mapper> {
      */
     protected static boolean hasIndexCreated(Settings settings) {
         return settings.hasValue(IndexMetadata.SETTING_INDEX_VERSION_CREATED.getKey());
+    }
+
+    /**
+     * Method to determine, if it is possible to derive source for this field using field mapping parameters
+     */
+    public void canDeriveSource() {
+        throw new UnsupportedOperationException("Derived source field is not supported for [" + name() + "] field");
+    }
+
+    /**
+     * Method used for deriving source and building it to XContentBuilder object
+     * @param builder - builder to store the derived source filed
+     * @param leafReader - leafReader to read data from
+     * @param docId - docId for which we want to derive the source
+     */
+    public void deriveSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        throw new UnsupportedOperationException("Derived source field is not supported for [" + name() + "] field");
     }
 }

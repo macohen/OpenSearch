@@ -39,9 +39,12 @@ import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.InstanceProfileCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.SdkSystemSetting;
+import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
+import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
 import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
 import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
 import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.core.retry.RetryMode;
 import software.amazon.awssdk.core.retry.RetryPolicy;
 import software.amazon.awssdk.core.retry.backoff.BackoffStrategy;
 import software.amazon.awssdk.http.SystemPropertyTlsKeyManagersProvider;
@@ -50,6 +53,7 @@ import software.amazon.awssdk.http.apache.ProxyConfiguration;
 import software.amazon.awssdk.http.apache.internal.conn.SdkTlsSocketFactory;
 import software.amazon.awssdk.profiles.ProfileFileSystemSetting;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.LegacyMd5Plugin;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.sts.StsClient;
@@ -91,6 +95,7 @@ import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
 
 import static java.util.Collections.emptyMap;
 
@@ -114,10 +119,20 @@ class S3Service implements Closeable {
      */
     private volatile Map<Settings, S3ClientSettings> derivedClientSettings = new ConcurrentHashMap<>();
 
-    S3Service(final Path configPath) {
+    /**
+     * Optional scheduled executor service to use for the client
+     */
+    private final @Nullable ScheduledExecutorService clientExecutorService;
+
+    S3Service(final Path configPath, @Nullable ScheduledExecutorService clientExecutorService) {
         staticClientSettings = MapBuilder.<String, S3ClientSettings>newMapBuilder()
             .put("default", S3ClientSettings.getClientSettings(Settings.EMPTY, "default", configPath))
             .immutableMap();
+        this.clientExecutorService = clientExecutorService;
+    }
+
+    S3Service(final Path configPath) {
+        this(configPath, null);
     }
 
     /**
@@ -203,7 +218,7 @@ class S3Service implements Closeable {
         final AwsCredentialsProvider credentials = buildCredentials(logger, clientSettings);
         builder.credentialsProvider(credentials);
         builder.httpClientBuilder(buildHttpClient(clientSettings));
-        builder.overrideConfiguration(buildOverrideConfiguration(clientSettings));
+        builder.overrideConfiguration(buildOverrideConfiguration(clientSettings, clientExecutorService));
 
         String endpoint = Strings.hasLength(clientSettings.endpoint) ? clientSettings.endpoint : DEFAULT_S3_ENDPOINT;
         if ((endpoint.startsWith("http://") || endpoint.startsWith("https://")) == false) {
@@ -230,6 +245,11 @@ class S3Service implements Closeable {
         }
         if (clientSettings.disableChunkedEncoding) {
             builder.serviceConfiguration(s -> s.chunkedEncodingEnabled(false));
+        }
+        builder.requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED)
+            .responseChecksumValidation(ResponseChecksumValidation.WHEN_REQUIRED);
+        if (clientSettings.legacyMd5ChecksumCalculation) {
+            builder.addPlugin(LegacyMd5Plugin.create());
         }
         final S3Client client = SocketAccess.doPrivileged(builder::build);
         return AmazonS3WithCredentials.create(client, credentials);
@@ -279,6 +299,8 @@ class S3Service implements Closeable {
         }
 
         clientBuilder.socketTimeout(Duration.ofMillis(clientSettings.readTimeoutMillis));
+        clientBuilder.maxConnections(clientSettings.maxSyncConnections);
+        clientBuilder.connectionAcquisitionTimeout(Duration.ofMillis(clientSettings.connectionAcquisitionTimeoutMillis));
 
         return clientBuilder;
     }
@@ -315,8 +337,14 @@ class S3Service implements Closeable {
         return proxyConfiguration.build();
     }
 
-    static ClientOverrideConfiguration buildOverrideConfiguration(final S3ClientSettings clientSettings) {
+    static ClientOverrideConfiguration buildOverrideConfiguration(
+        final S3ClientSettings clientSettings,
+        @Nullable ScheduledExecutorService clientExecutorService
+    ) {
         ClientOverrideConfiguration.Builder clientOverrideConfiguration = ClientOverrideConfiguration.builder();
+        if (clientExecutorService != null) {
+            clientOverrideConfiguration = clientOverrideConfiguration.scheduledExecutorService(clientExecutorService);
+        }
         if (Strings.hasLength(clientSettings.signerOverride)) {
             clientOverrideConfiguration = clientOverrideConfiguration.putAdvancedOption(
                 SdkAdvancedClientOption.SIGNER,
@@ -328,6 +356,8 @@ class S3Service implements Closeable {
         );
         if (!clientSettings.throttleRetries) {
             retryPolicy.throttlingBackoffStrategy(BackoffStrategy.none());
+        } else {
+            retryPolicy.throttlingBackoffStrategy(BackoffStrategy.defaultThrottlingStrategy(RetryMode.STANDARD));
         }
         return clientOverrideConfiguration.retryPolicy(retryPolicy.build()).build();
     }
@@ -504,5 +534,10 @@ class S3Service implements Closeable {
     @Override
     public void close() {
         releaseCachedClients();
+    }
+
+    @Nullable
+    ScheduledExecutorService getClientExecutorService() {
+        return clientExecutorService;
     }
 }

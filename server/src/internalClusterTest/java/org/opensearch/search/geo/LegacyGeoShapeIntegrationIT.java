@@ -41,7 +41,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.common.geo.builders.ShapeBuilder;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.ToXContent;
@@ -75,11 +74,6 @@ public class LegacyGeoShapeIntegrationIT extends ParameterizedStaticSettingsOpen
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     /**
@@ -196,7 +190,7 @@ public class LegacyGeoShapeIntegrationIT extends ParameterizedStaticSettingsOpen
 
         indexRandom(true, client().prepareIndex("test").setId("0").setSource("shape", polygonGeoJson));
         SearchResponse searchResponse = client().prepareSearch("test").setQuery(matchAllQuery()).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     /**
@@ -232,7 +226,7 @@ public class LegacyGeoShapeIntegrationIT extends ParameterizedStaticSettingsOpen
             .setQuery(geoShapeQuery("shape", "0").indexedShapeIndex("test").indexedShapeRouting("ABC"))
             .get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     /**
@@ -259,7 +253,7 @@ public class LegacyGeoShapeIntegrationIT extends ParameterizedStaticSettingsOpen
 
         // test self crossing of circles
         SearchResponse searchResponse = client().prepareSearch("test").setQuery(geoShapeQuery("shape", new Circle(30, 50, 77000))).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     public void testDisallowExpensiveQueries() throws InterruptedException, IOException {
@@ -287,7 +281,7 @@ public class LegacyGeoShapeIntegrationIT extends ParameterizedStaticSettingsOpen
             SearchResponse searchResponse = client().prepareSearch("test")
                 .setQuery(geoShapeQuery("shape", new Circle(30, 50, 77000)))
                 .get();
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
             ClusterUpdateSettingsRequest updateSettingsRequest = new ClusterUpdateSettingsRequest();
             updateSettingsRequest.persistentSettings(Settings.builder().put("search.allow_expensive_queries", false));
@@ -309,7 +303,7 @@ public class LegacyGeoShapeIntegrationIT extends ParameterizedStaticSettingsOpen
             updateSettingsRequest.persistentSettings(Settings.builder().put("search.allow_expensive_queries", true));
             assertAcked(client().admin().cluster().updateSettings(updateSettingsRequest).actionGet());
             searchResponse = client().prepareSearch("test").setQuery(geoShapeQuery("shape", new Circle(30, 50, 77000))).get();
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
         } finally {
             ClusterUpdateSettingsRequest updateSettingsRequest = new ClusterUpdateSettingsRequest();
             updateSettingsRequest.persistentSettings(Settings.builder().put("search.allow_expensive_queries", (String) null));

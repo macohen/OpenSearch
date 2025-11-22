@@ -77,6 +77,7 @@ import org.opensearch.common.lucene.search.MultiPhrasePrefixQuery;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.AnalyzerScope;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
@@ -448,7 +449,6 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
                 pft.setStoreTermVectorOffsets(true);
             }
             PrefixFieldType prefixFieldType = new PrefixFieldType(tft, fullName + "._index_prefix", indexPrefixes.get());
-            prefixFieldType.setAnalyzer(analyzers.getIndexAnalyzer());
             tft.setPrefixFieldType(prefixFieldType);
             return new PrefixFieldMapper(pft, prefixFieldType);
         }
@@ -472,6 +472,9 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         public TextFieldMapper build(BuilderContext context) {
             FieldType fieldType = TextParams.buildFieldType(index, store, indexOptions, norms, termVectors);
             TextFieldType tft = buildFieldType(fieldType, context);
+            if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false)) {
+                fieldType.setStored(true);
+            }
             return new TextFieldMapper(
                 name,
                 fieldType,
@@ -522,17 +525,24 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         private final int minChars;
         private final int maxChars;
         private final Analyzer delegate;
+        private final int positionIncrementGap;
 
-        PrefixWrappedAnalyzer(Analyzer delegate, int minChars, int maxChars) {
+        PrefixWrappedAnalyzer(Analyzer delegate, int minChars, int maxChars, int positionIncrementGap) {
             super(delegate.getReuseStrategy());
             this.delegate = delegate;
             this.minChars = minChars;
             this.maxChars = maxChars;
+            this.positionIncrementGap = positionIncrementGap;
         }
 
         @Override
         protected Analyzer getWrappedAnalyzer(String fieldName) {
             return delegate;
+        }
+
+        @Override
+        public int getPositionIncrementGap(String fieldName) {
+            return positionIncrementGap;
         }
 
         @Override
@@ -588,17 +598,18 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
 
         final int minChars;
         final int maxChars;
-        final TextFieldType parentField;
+        final TextFieldType parent;
 
         PrefixFieldType(TextFieldType parentField, String name, PrefixConfig config) {
             this(parentField, name, config.minChars, config.maxChars);
         }
 
-        PrefixFieldType(TextFieldType parentField, String name, int minChars, int maxChars) {
-            super(name, true, false, false, parentField.getTextSearchInfo(), Collections.emptyMap());
+        PrefixFieldType(TextFieldType parent, String name, int minChars, int maxChars) {
+            super(name, true, false, false, parent.getTextSearchInfo(), Collections.emptyMap());
             this.minChars = minChars;
             this.maxChars = maxChars;
-            this.parentField = parentField;
+            this.parent = parent;
+            setAnalyzer(parent.indexAnalyzer());
         }
 
         @Override
@@ -609,8 +620,13 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         }
 
         void setAnalyzer(NamedAnalyzer delegate) {
+            String analyzerName = delegate.name();
             setIndexAnalyzer(
-                new NamedAnalyzer(delegate.name(), AnalyzerScope.INDEX, new PrefixWrappedAnalyzer(delegate.analyzer(), minChars, maxChars))
+                new NamedAnalyzer(
+                    analyzerName,
+                    AnalyzerScope.INDEX,
+                    new PrefixWrappedAnalyzer(delegate.analyzer(), minChars, maxChars, delegate.getPositionIncrementGap(analyzerName))
+                )
             );
         }
 
@@ -628,7 +644,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             }
             List<Automaton> automata = new ArrayList<>();
             if (caseInsensitive) {
-                automata.add(AutomatonQueries.toCaseInsensitiveString(value, Integer.MAX_VALUE));
+                automata.add(AutomatonQueries.toCaseInsensitiveString(value));
             } else {
                 automata.add(Automata.makeString(value));
             }
@@ -639,7 +655,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             Automaton automaton = Operations.concatenate(automata);
             AutomatonQuery query = AutomatonQueries.createAutomatonQuery(new Term(name(), value + "*"), automaton, method);
             return new BooleanQuery.Builder().add(query, BooleanClause.Occur.SHOULD)
-                .add(new TermQuery(new Term(parentField.name(), value)), BooleanClause.Occur.SHOULD)
+                .add(new TermQuery(new Term(parent.name(), value)), BooleanClause.Occur.SHOULD)
                 .build();
         }
 
@@ -834,6 +850,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             Query tq = prefixFieldType.prefixQuery(value, method, caseInsensitive, context);
             if (method == null
                 || method == MultiTermQuery.CONSTANT_SCORE_REWRITE
+                || method == MultiTermQuery.CONSTANT_SCORE_BLENDED_REWRITE
                 || method == MultiTermQuery.CONSTANT_SCORE_BOOLEAN_REWRITE) {
                 return new ConstantScoreQuery(tq);
             }
@@ -1018,13 +1035,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     protected void parseCreateField(ParseContext context) throws IOException {
-        final String value;
-        if (context.externalValueSet()) {
-            value = context.externalValue().toString();
-        } else {
-            value = context.parser().textOrNull();
-        }
-
+        final String value = getFieldValue(context);
         if (value == null) {
             return;
         }
@@ -1041,6 +1052,15 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
             if (phraseFieldMapper != null) {
                 context.doc().add(new Field(phraseFieldMapper.fieldType().name(), value, phraseFieldMapper.fieldType));
             }
+        }
+    }
+
+    @Override
+    protected String getFieldValue(ParseContext context) throws IOException {
+        if (context.externalValueSet()) {
+            return context.externalValue().toString();
+        } else {
+            return context.parser().textOrNull();
         }
     }
 
@@ -1212,5 +1232,21 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         mapperBuilder.freqFilter.toXContent(builder, includeDefaults);
         mapperBuilder.indexPrefixes.toXContent(builder, includeDefaults);
         mapperBuilder.indexPhrases.toXContent(builder, includeDefaults);
+    }
+
+    @Override
+    protected void canDeriveSourceInternal() {}
+
+    /**
+     * Derive source using stored field, which would always be present for derived source enabled index field
+     */
+    @Override
+    protected DerivedFieldGenerator derivedFieldGenerator() {
+        return new DerivedFieldGenerator(mappedFieldType, null, new StoredFieldFetcher(mappedFieldType, simpleName())) {
+            @Override
+            public FieldValueType getDerivedFieldPreference() {
+                return FieldValueType.STORED;
+            }
+        };
     }
 }

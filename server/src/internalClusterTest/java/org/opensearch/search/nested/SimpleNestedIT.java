@@ -47,7 +47,6 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.search.SearchType;
 import org.opensearch.cluster.health.ClusterHealthStatus;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -91,20 +90,15 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         );
     }
 
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
     public void testSimpleNested() throws Exception {
         assertAcked(prepareCreate("test").setMapping("nested1", "type=nested"));
         ensureGreen();
 
         // check on no data, see it works
         SearchResponse searchResponse = client().prepareSearch("test").get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
         searchResponse = client().prepareSearch("test").setQuery(termQuery("n_field1", "n_value1_1")).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         client().prepareIndex("test")
             .setId("1")
@@ -135,27 +129,27 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
         assertDocumentCount("test", 3);
 
         searchResponse = client().prepareSearch("test").setQuery(termQuery("n_field1", "n_value1_1")).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         // search for something that matches the nested doc, and see that we don't find the nested doc
         searchResponse = client().prepareSearch("test").setQuery(matchAllQuery()).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
         searchResponse = client().prepareSearch("test").setQuery(termQuery("n_field1", "n_value1_1")).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         // now, do a nested query
         searchResponse = client().prepareSearch("test")
             .setQuery(nestedQuery("nested1", termQuery("nested1.n_field1", "n_value1_1"), ScoreMode.Avg))
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(nestedQuery("nested1", termQuery("nested1.n_field1", "n_value1_1"), ScoreMode.Avg))
             .setSearchType(SearchType.DFS_QUERY_THEN_FETCH)
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         // add another doc, one that would match if it was not nested...
 
@@ -191,7 +185,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         // filter
         searchResponse = client().prepareSearch("test")
@@ -207,7 +201,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         // check with type prefix
         searchResponse = client().prepareSearch("test")
@@ -220,7 +214,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         // check delete, so all is gone...
         DeleteResponse deleteResponse = client().prepareDelete("test", "2").get();
@@ -233,7 +227,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             .setQuery(nestedQuery("nested1", termQuery("nested1.n_field1", "n_value1_1"), ScoreMode.Avg))
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     public void testMultiNested() throws Exception {
@@ -301,13 +295,13 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             .setQuery(nestedQuery("nested1", termQuery("nested1.field1", "1"), ScoreMode.Avg))
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(nestedQuery("nested1.nested2", termQuery("nested1.nested2.field2", "2"), ScoreMode.Avg))
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(
@@ -320,7 +314,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(
@@ -333,7 +327,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(
@@ -346,7 +340,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(
@@ -359,7 +353,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(
@@ -372,7 +366,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("test")
             .setQuery(
@@ -385,7 +379,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             )
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
     }
 
     // When IncludeNestedDocsQuery is wrapped in a FilteredQuery then a in-finite loop occurs b/c of a bug in
@@ -499,10 +493,10 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
             .setExplain(true)
             .get();
         assertNoFailures(searchResponse);
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
         Explanation explanation = searchResponse.getHits().getHits()[0].getExplanation();
         assertThat(explanation.getValue(), equalTo(searchResponse.getHits().getHits()[0].getScore()));
-        assertThat(explanation.toString(), startsWith("0.36464313 = Score based on 2 child docs in range from 0 to 1"));
+        assertThat(explanation.toString(), startsWith("0.16574687 = Score based on 2 child docs in range from 0 to 1"));
     }
 
     public void testSimpleNestedSorting() throws Exception {
@@ -1675,7 +1669,7 @@ public class SimpleNestedIT extends ParameterizedStaticSettingsOpenSearchIntegTe
                 .setQuery(nestedQuery("array1", termQuery("array1.field1", "value1"), ScoreMode.Avg))
                 .get();
             assertNoFailures(searchResponse);
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(5L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(5L));
         }
         clusterStatsResponse = client().admin().cluster().prepareClusterStats().get();
         assertThat(clusterStatsResponse.getIndicesStats().getSegments().getBitsetMemoryInBytes(), greaterThan(0L));

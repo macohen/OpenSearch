@@ -31,10 +31,13 @@ public class FeatureFlagSettings extends AbstractScopedSettings {
 
     public static final Set<Setting<?>> BUILT_IN_FEATURE_FLAGS = Set.of(
         FeatureFlags.EXTENSIONS_SETTING,
-        FeatureFlags.IDENTITY_SETTING,
-        FeatureFlags.CONCURRENT_SEGMENT_SEARCH_SETTING,
         FeatureFlags.TELEMETRY_SETTING,
         FeatureFlags.DATETIME_FORMATTER_CACHING_SETTING,
-        FeatureFlags.WRITEABLE_REMOTE_INDEX_SETTING
+        FeatureFlags.WRITABLE_WARM_INDEX_SETTING,
+        FeatureFlags.REMOTE_STORE_MIGRATION_EXPERIMENTAL_SETTING,
+        FeatureFlags.APPLICATION_BASED_CONFIGURATION_TEMPLATES_SETTING,
+        FeatureFlags.TERM_VERSION_PRECOMMIT_ENABLE_SETTING,
+        FeatureFlags.ARROW_STREAMS_SETTING,
+        FeatureFlags.STREAM_TRANSPORT_SETTING
     );
 }

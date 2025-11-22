@@ -64,6 +64,7 @@ import org.opensearch.action.support.replication.TransportWriteActionTestHelper;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.AllocationId;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
@@ -96,11 +97,15 @@ import org.opensearch.index.seqno.RetentionLeaseSyncer;
 import org.opensearch.index.seqno.RetentionLeases;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardTestCase;
+import org.opensearch.index.shard.IndexShardTestUtils;
 import org.opensearch.index.shard.PrimaryReplicaSyncer;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.indices.recovery.DefaultRecoverySettings;
+import org.opensearch.indices.recovery.RecoverySettings;
 import org.opensearch.indices.recovery.RecoveryState;
 import org.opensearch.indices.recovery.RecoveryTarget;
+import org.opensearch.indices.replication.checkpoint.MergedSegmentPublisher;
 import org.opensearch.tasks.TaskManager;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.threadpool.ThreadPool.Names;
@@ -148,17 +153,48 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
 
     protected ReplicationGroup createGroup(int replicas, Settings settings, String mappings, EngineFactory engineFactory)
         throws IOException {
+        return createGroup(replicas, settings, mappings, engineFactory, DefaultRecoverySettings.INSTANCE, MergedSegmentPublisher.EMPTY);
+    }
+
+    protected ReplicationGroup createGroup(
+        int replicas,
+        Settings settings,
+        String mappings,
+        EngineFactory engineFactory,
+        RecoverySettings recoverySettings,
+        MergedSegmentPublisher mergedSegmentPublisher
+    ) throws IOException {
         Path remotePath = null;
         if ("true".equals(settings.get(IndexMetadata.SETTING_REMOTE_STORE_ENABLED))) {
             remotePath = createTempDir();
         }
-        return createGroup(replicas, settings, mappings, engineFactory, remotePath);
+        return createGroup(replicas, settings, mappings, engineFactory, recoverySettings, remotePath, mergedSegmentPublisher);
     }
 
     protected ReplicationGroup createGroup(int replicas, Settings settings, String mappings, EngineFactory engineFactory, Path remotePath)
         throws IOException {
+        return createGroup(
+            replicas,
+            settings,
+            mappings,
+            engineFactory,
+            DefaultRecoverySettings.INSTANCE,
+            remotePath,
+            MergedSegmentPublisher.EMPTY
+        );
+    }
+
+    protected ReplicationGroup createGroup(
+        int replicas,
+        Settings settings,
+        String mappings,
+        EngineFactory engineFactory,
+        RecoverySettings recoverySettings,
+        Path remotePath,
+        MergedSegmentPublisher mergedSegmentPublisher
+    ) throws IOException {
         IndexMetadata metadata = buildIndexMetadata(replicas, settings, mappings);
-        return new ReplicationGroup(metadata, remotePath) {
+        return new ReplicationGroup(metadata, recoverySettings, remotePath, mergedSegmentPublisher) {
             @Override
             protected EngineFactory getEngineFactory(ShardRouting routing) {
                 return engineFactory;
@@ -251,6 +287,15 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
         }
 
         protected ReplicationGroup(final IndexMetadata indexMetadata, Path remotePath) throws IOException {
+            this(indexMetadata, DefaultRecoverySettings.INSTANCE, remotePath, MergedSegmentPublisher.EMPTY);
+        }
+
+        protected ReplicationGroup(
+            final IndexMetadata indexMetadata,
+            RecoverySettings recoverySettings,
+            Path remotePath,
+            MergedSegmentPublisher mergedSegmentPublisher
+        ) throws IOException {
             final ShardRouting primaryRouting = this.createShardRouting("s0", true);
             primary = newShard(
                 primaryRouting,
@@ -259,7 +304,9 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
                 getEngineFactory(primaryRouting),
                 () -> {},
                 retentionLeaseSyncer,
-                remotePath
+                recoverySettings,
+                remotePath,
+                mergedSegmentPublisher
             );
             replicas = new CopyOnWriteArrayList<>();
             this.indexMetadata = indexMetadata;
@@ -285,6 +332,10 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
 
         protected EngineConfigFactory getEngineConfigFactory(IndexSettings indexSettings) {
             return new EngineConfigFactory(indexSettings);
+        }
+
+        public IndexMetadata getIndexMetadata() {
+            return indexMetadata;
         }
 
         public int indexDocs(final int numOfDoc) throws Exception {
@@ -340,6 +391,23 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
             startReplicas(replicas.size());
         }
 
+        public synchronized DiscoveryNodes generateFakeDiscoveryNodes() {
+            DiscoveryNodes.Builder builder = new DiscoveryNodes.Builder();
+            if (primary.indexSettings() != null && primary.indexSettings().isAssignedOnRemoteNode()) {
+                builder.add(IndexShardTestUtils.getFakeRemoteEnabledNode(primary.routingEntry().currentNodeId()));
+            } else {
+                builder.add(IndexShardTestUtils.getFakeDiscoNode(primary.routingEntry().currentNodeId()));
+            }
+            for (IndexShard replica : replicas) {
+                if (replica.indexSettings() != null && replica.indexSettings().isAssignedOnRemoteNode()) {
+                    builder.add(IndexShardTestUtils.getFakeRemoteEnabledNode(replica.routingEntry().currentNodeId()));
+                } else {
+                    builder.add(IndexShardTestUtils.getFakeDiscoNode(replica.routingEntry().currentNodeId()));
+                }
+            }
+            return builder.build();
+        }
+
         public synchronized int startReplicas(int numOfReplicasToStart) throws IOException {
             if (primary.routingEntry().initializing()) {
                 startPrimary();
@@ -354,6 +422,8 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
                     }
                 }
             }
+            // Update the status of the replicas in the routing table to IndexShardState.STARTED.
+            updateAllocationIDsOnPrimary();
             return started;
         }
 
@@ -371,7 +441,8 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
                 null,
                 currentClusterStateVersion.incrementAndGet(),
                 activeIds,
-                routingTable
+                routingTable,
+                generateFakeDiscoveryNodes()
             );
             for (final IndexShard replica : replicas) {
                 recoverReplica(replica);
@@ -492,7 +563,8 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
                 primaryReplicaSyncer,
                 currentClusterStateVersion.incrementAndGet(),
                 activeIds(),
-                routingTable
+                routingTable,
+                generateFakeDiscoveryNodes()
             );
         }
 
@@ -520,7 +592,7 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
         }
 
         public void recoverReplica(IndexShard replica) throws IOException {
-            recoverReplica(replica, (r, sourceNode) -> new RecoveryTarget(r, sourceNode, recoveryListener));
+            recoverReplica(replica, (r, sourceNode) -> new RecoveryTarget(r, sourceNode, recoveryListener, threadPool));
         }
 
         public void recoverReplica(IndexShard replica, BiFunction<IndexShard, DiscoveryNode, RecoveryTarget> targetSupplier)
@@ -638,14 +710,16 @@ public abstract class OpenSearchIndexLevelReplicationTestCase extends IndexShard
         }
 
         private void updateAllocationIDsOnPrimary() throws IOException {
-
             primary.updateShardState(
                 primary.routingEntry(),
                 primary.getPendingPrimaryTerm(),
                 null,
                 currentClusterStateVersion.incrementAndGet(),
                 activeIds(),
-                routingTable(Function.identity())
+                routingTable(Function.identity()),
+                primary.indexSettings().isRemoteTranslogStoreEnabled()
+                    ? IndexShardTestUtils.getFakeRemoteEnabledDiscoveryNodes(routingTable(Function.identity()).getShards())
+                    : IndexShardTestUtils.getFakeDiscoveryNodes(routingTable(Function.identity()).getShards())
             );
         }
 

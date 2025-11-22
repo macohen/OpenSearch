@@ -206,7 +206,7 @@ public class Task {
      * Build a proper {@link TaskInfo} for this task.
      */
     protected final TaskInfo taskInfo(String localNodeId, String description, Status status, TaskResourceStats resourceStats) {
-        boolean cancelled = this instanceof CancellableTask && ((CancellableTask) this).isCancelled();
+        boolean cancelled = this instanceof CancellableTask cancellableTask && cancellableTask.isCancelled();
         Long cancellationStartTime = null;
         if (cancelled) {
             cancellationStartTime = ((CancellableTask) this).getCancellationStartTime();
@@ -476,6 +476,18 @@ public class Task {
         throw new IllegalStateException("cannot update final values if active thread resource entry is not present");
     }
 
+    public ThreadResourceInfo getActiveThreadResourceInfo(long threadId, ResourceStatsType statsType) {
+        final List<ThreadResourceInfo> threadResourceInfoList = resourceStats.get(threadId);
+        if (threadResourceInfoList != null) {
+            for (ThreadResourceInfo threadResourceInfo : threadResourceInfoList) {
+                if (threadResourceInfo.getStatsType() == statsType && threadResourceInfo.isActive()) {
+                    return threadResourceInfo;
+                }
+            }
+        }
+        return null;
+    }
+
     /**
      * Individual tasks can override this if they want to support task resource tracking. We just need to make sure that
      * the ThreadPool on which the task runs on have runnable wrapper similar to
@@ -516,8 +528,8 @@ public class Task {
     }
 
     public TaskResult result(final String nodeId, ActionResponse response) throws IOException {
-        if (response instanceof ToXContent) {
-            return new TaskResult(taskInfo(nodeId, true, true), (ToXContent) response);
+        if (response instanceof ToXContent toXContent) {
+            return new TaskResult(taskInfo(nodeId, true, true), toXContent);
         } else {
             throw new IllegalStateException("response has to implement ToXContent to be able to store the results");
         }

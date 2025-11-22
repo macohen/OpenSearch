@@ -77,6 +77,29 @@ public abstract class QueryCollectorContext {
         }
     };
 
+    public static final QueryCollectorContext EMPTY_CONTEXT = new QueryCollectorContext("empty") {
+
+        @Override
+        Collector create(Collector in) throws IOException {
+            return EMPTY_COLLECTOR;
+        }
+
+        @Override
+        CollectorManager<?, ReduceableSearchResult> createManager(CollectorManager<?, ReduceableSearchResult> in) throws IOException {
+            return new CollectorManager<Collector, ReduceableSearchResult>() {
+                @Override
+                public Collector newCollector() throws IOException {
+                    return EMPTY_COLLECTOR;
+                }
+
+                @Override
+                public ReduceableSearchResult reduce(Collection<Collector> collectors) throws IOException {
+                    return result -> {};
+                }
+            };
+        }
+    };
+
     private String profilerName;
 
     QueryCollectorContext(String profilerName) {
@@ -226,10 +249,10 @@ public abstract class QueryCollectorContext {
                 children.add(in);
                 for (CollectorManager<? extends Collector, ReduceableSearchResult> manager : subs) {
                     final InternalProfileCollectorManager subCollectorManager;
-                    if (manager instanceof AggregationCollectorManager) {
+                    if (manager instanceof AggregationCollectorManager aggregationCollectorManager) {
                         subCollectorManager = new InternalProfileCollectorManager(
                             manager,
-                            ((AggregationCollectorManager) manager).getCollectorReason(),
+                            aggregationCollectorManager.getCollectorReason(),
                             Collections.emptyList()
                         );
                     } else {

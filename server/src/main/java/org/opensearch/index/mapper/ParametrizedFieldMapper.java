@@ -95,7 +95,7 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
     public abstract ParametrizedFieldMapper.Builder getMergeBuilder();
 
     @Override
-    public final ParametrizedFieldMapper merge(Mapper mergeWith) {
+    public ParametrizedFieldMapper merge(Mapper mergeWith) {
 
         if (mergeWith instanceof FieldMapper == false) {
             throw new IllegalArgumentException(
@@ -348,7 +348,7 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
             }
         }
 
-        protected void toXContent(XContentBuilder builder, boolean includeDefaults) throws IOException {
+        public void toXContent(XContentBuilder builder, boolean includeDefaults) throws IOException {
             if (serializerCheck.check(includeDefaults, isConfigured(), get())) {
                 serializer.serialize(builder, name, getValue());
             }
@@ -649,7 +649,7 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
         /**
          * Writes the current builder parameter values as XContent
          */
-        protected final void toXContent(XContentBuilder builder, boolean includeDefaults) throws IOException {
+        public final void toXContent(XContentBuilder builder, boolean includeDefaults) throws IOException {
             for (Parameter<?> parameter : getParameters()) {
                 parameter.toXContent(builder, includeDefaults);
             }
@@ -670,12 +670,16 @@ public abstract class ParametrizedFieldMapper extends FieldMapper {
                     deprecatedParamsMap.put(deprecatedName, param);
                 }
             }
-            String type = (String) fieldNode.remove("type");
+            String type = (String) fieldNode.get("type");
+            if (paramsMap.get("type") == null) {
+                fieldNode.remove("type");
+            }
+
             for (Iterator<Map.Entry<String, Object>> iterator = fieldNode.entrySet().iterator(); iterator.hasNext();) {
                 Map.Entry<String, Object> entry = iterator.next();
                 final String propName = entry.getKey();
                 final Object propNode = entry.getValue();
-                if (Objects.equals("fields", propName)) {
+                if (Objects.equals("fields", propName) && !name.equals(ContextAwareGroupingFieldMapper.CONTENT_TYPE)) {
                     TypeParsers.parseMultiField(multiFieldsBuilder::add, name, parserContext, propName, propNode);
                     iterator.remove();
                     continue;

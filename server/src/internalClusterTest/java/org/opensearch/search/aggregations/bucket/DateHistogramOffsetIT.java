@@ -38,7 +38,6 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.time.DateFormatter;
 import org.opensearch.common.time.DateFormatters;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.index.mapper.DateFieldMapper;
 import org.opensearch.search.aggregations.bucket.histogram.DateHistogramInterval;
 import org.opensearch.search.aggregations.bucket.histogram.Histogram;
@@ -86,11 +85,6 @@ public class DateHistogramOffsetIT extends ParameterizedStaticSettingsOpenSearch
         );
     }
 
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
-    }
-
     private ZonedDateTime date(String date) {
         return DateFormatters.from(DateFieldMapper.getDefaultDateTimeFormatter().parse(date));
     }
@@ -128,7 +122,7 @@ public class DateHistogramOffsetIT extends ParameterizedStaticSettingsOpenSearch
             )
             .get();
 
-        assertThat(response.getHits().getTotalHits().value, equalTo(5L));
+        assertThat(response.getHits().getTotalHits().value(), equalTo(5L));
 
         Histogram histo = response.getAggregations().get("date_histo");
         List<? extends Histogram.Bucket> buckets = histo.getBuckets();
@@ -148,7 +142,7 @@ public class DateHistogramOffsetIT extends ParameterizedStaticSettingsOpenSearch
             )
             .get();
 
-        assertThat(response.getHits().getTotalHits().value, equalTo(5L));
+        assertThat(response.getHits().getTotalHits().value(), equalTo(5L));
 
         Histogram histo = response.getAggregations().get("date_histo");
         List<? extends Histogram.Bucket> buckets = histo.getBuckets();
@@ -176,7 +170,7 @@ public class DateHistogramOffsetIT extends ParameterizedStaticSettingsOpenSearch
             )
             .get();
 
-        assertThat(response.getHits().getTotalHits().value, equalTo(24L));
+        assertThat(response.getHits().getTotalHits().value(), equalTo(24L));
 
         Histogram histo = response.getAggregations().get("date_histo");
         List<? extends Histogram.Bucket> buckets = histo.getBuckets();

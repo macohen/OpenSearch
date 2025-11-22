@@ -41,7 +41,6 @@ import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.common.geo.builders.PointBuilder;
 import org.opensearch.common.geo.builders.ShapeBuilder;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexService;
@@ -73,11 +72,6 @@ public class GeoShapeIntegrationIT extends ParameterizedStaticSettingsOpenSearch
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     @Override
@@ -200,7 +194,7 @@ public class GeoShapeIntegrationIT extends ParameterizedStaticSettingsOpenSearch
 
         indexRandom(true, client().prepareIndex("test").setId("0").setSource("shape", polygonGeoJson));
         SearchResponse searchResponse = client().prepareSearch("test").setQuery(matchAllQuery()).get();
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     public void testMappingUpdate() throws Exception {
@@ -256,7 +250,7 @@ public class GeoShapeIntegrationIT extends ParameterizedStaticSettingsOpenSearch
             .setQuery(geoShapeQuery("shape", "0").indexedShapeIndex("test").indexedShapeRouting("ABC"))
             .get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     public void testIndexPolygonDateLine() throws Exception {
@@ -298,19 +292,19 @@ public class GeoShapeIntegrationIT extends ParameterizedStaticSettingsOpenSearch
                 .setQuery(geoShapeQuery("shape", new PointBuilder(-179.75, 1)))
                 .get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
             searchResponse = client().prepareSearch("quad").setQuery(geoShapeQuery("shape", new PointBuilder(90, 1))).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
             searchResponse = client().prepareSearch("quad").setQuery(geoShapeQuery("shape", new PointBuilder(-180, 1))).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
             searchResponse = client().prepareSearch("quad").setQuery(geoShapeQuery("shape", new PointBuilder(180, 1))).get();
 
-            assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
         } finally {
             ClusterUpdateSettingsRequest updateSettingsRequest = new ClusterUpdateSettingsRequest();
             updateSettingsRequest.persistentSettings(Settings.builder().put("search.allow_expensive_queries", (String) null));
@@ -319,19 +313,19 @@ public class GeoShapeIntegrationIT extends ParameterizedStaticSettingsOpenSearch
 
         SearchResponse searchResponse = client().prepareSearch("vector").setQuery(geoShapeQuery("shape", new PointBuilder(90, 1))).get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(0L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(0L));
 
         searchResponse = client().prepareSearch("vector").setQuery(geoShapeQuery("shape", new PointBuilder(-179.75, 1))).get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("vector").setQuery(geoShapeQuery("shape", new PointBuilder(-180, 1))).get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
 
         searchResponse = client().prepareSearch("vector").setQuery(geoShapeQuery("shape", new PointBuilder(180, 1))).get();
 
-        assertThat(searchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(searchResponse.getHits().getTotalHits().value(), equalTo(1L));
     }
 
     private String findNodeName(String index) {

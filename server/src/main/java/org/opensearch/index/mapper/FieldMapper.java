@@ -35,6 +35,8 @@ package org.opensearch.index.mapper;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.LeafReader;
+import org.opensearch.common.Explicit;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
@@ -42,6 +44,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.xcontent.AbstractXContentParser;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.mapper.FieldNamesFieldMapper.FieldNamesFieldType;
 
@@ -213,6 +216,7 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
     protected MappedFieldType mappedFieldType;
     protected MultiFields multiFields;
     protected CopyTo copyTo;
+    protected DerivedFieldGenerator derivedFieldGenerator;
 
     protected FieldMapper(String simpleName, FieldType fieldType, MappedFieldType mappedFieldType, MultiFields multiFields, CopyTo copyTo) {
         super(simpleName);
@@ -224,6 +228,7 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
         this.mappedFieldType = mappedFieldType;
         this.multiFields = multiFields;
         this.copyTo = Objects.requireNonNull(copyTo);
+        this.derivedFieldGenerator = derivedFieldGenerator();
     }
 
     @Override
@@ -261,15 +266,29 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
         return false;
     }
 
+    private boolean shouldIgnoreMalformed(IndexSettings is) {
+        if (ignoreMalformed() != null) {
+            return ignoreMalformed().value();
+        }
+
+        if (is == null) {
+            return false;
+        }
+
+        return IGNORE_MALFORMED_SETTING.get(is.getSettings());
+    }
+
     /**
      * Parse the field value using the provided {@link ParseContext}.
      */
     public void parse(ParseContext context) throws IOException {
         try {
             parseCreateField(context);
+            extractGroupingCriteriaParams(context);
         } catch (Exception e) {
-            boolean ignore_malformed = false;
-            if (context.indexSettings() != null) ignore_malformed = IGNORE_MALFORMED_SETTING.get(context.indexSettings().getSettings());
+
+            boolean ignoreMalformed = shouldIgnoreMalformed(context.indexSettings());
+
             String valuePreview = "";
             try {
                 XContentParser parser = context.parser();
@@ -280,7 +299,7 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
                     valuePreview = complexValue.toString();
                 }
             } catch (Exception innerException) {
-                if (ignore_malformed == false) {
+                if (ignoreMalformed == false) {
                     throw new MapperParsingException(
                         "failed to parse field [{}] of type [{}] in document with id '{}'. " + "Could not parse field value preview,",
                         e,
@@ -291,7 +310,7 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
                 }
             }
 
-            if (ignore_malformed == false) {
+            if (ignoreMalformed == false) {
                 throw new MapperParsingException(
                     "failed to parse field [{}] of type [{}] in document with id '{}'. " + "Preview of field's value: '{}'",
                     e,
@@ -312,6 +331,35 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
      * current failing token
      */
     protected abstract void parseCreateField(ParseContext context) throws IOException;
+
+    private void extractGroupingCriteriaParams(ParseContext context) throws IOException {
+        if (context.docMapper() != null && context.docMapper().mappers() != null) {
+            final Mapper mapper = context.docMapper().mappers().getMapper(ContextAwareGroupingFieldMapper.CONTENT_TYPE);
+            if (mapper != null) {
+                final ContextAwareGroupingFieldMapper contextAwareMapper = (ContextAwareGroupingFieldMapper) mapper;
+                if (contextAwareMapper.fieldType().fields().contains(name())) {
+                    Object value = getFieldValue(context);
+                    if (value == null) {
+                        throw new IllegalArgumentException(
+                            "field ["
+                                + name()
+                                + "] of type ["
+                                + fieldType().typeName()
+                                + "] cannot be null"
+                                + " when context-aware-grouping is set on that field"
+                        );
+                    }
+                    context.doc().addGroupingCriteriaParams(name(), value);
+                }
+            }
+        }
+    }
+
+    protected Object getFieldValue(ParseContext context) throws IOException {
+        throw new UnsupportedOperationException(
+            "getFieldValue not implemented for the field mapper [" + this.getClass().getSimpleName() + "]"
+        );
+    }
 
     protected final void createFieldNamesField(ParseContext context) {
         assert fieldType().hasDocValues() == false : "_field_names should only be used when doc_values are turned off";
@@ -388,7 +436,7 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
     public FieldMapper merge(Mapper mergeWith) {
         FieldMapper merged = clone();
         List<String> conflicts = new ArrayList<>();
-        if (mergeWith instanceof FieldMapper == false) {
+        if (!(mergeWith instanceof FieldMapper toMerge)) {
             throw new IllegalArgumentException(
                 "mapper ["
                     + mappedFieldType.name()
@@ -399,7 +447,6 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
                     + "]"
             );
         }
-        FieldMapper toMerge = (FieldMapper) mergeWith;
         merged.mergeSharedOptions(toMerge, conflicts);
         merged.mergeOptions(toMerge, conflicts);
         if (conflicts.isEmpty() == false) {
@@ -572,6 +619,100 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
     protected abstract String contentType();
 
     /**
+     * @return null if a mapper doesn't support setting of `ignore_malformed`
+     */
+    protected Explicit<Boolean> ignoreMalformed() {
+        return null;
+    }
+
+    /**
+     * Method to create derived source generator for this field mapper, it is illegal to enable the
+     * derived source feature and not implement this method for a field mapper
+     */
+    protected DerivedFieldGenerator derivedFieldGenerator() {
+        return null;
+    }
+
+    protected void setDerivedFieldGenerator(DerivedFieldGenerator derivedFieldGenerator) {
+        this.derivedFieldGenerator = derivedFieldGenerator;
+    }
+
+    protected DerivedFieldGenerator getDerivedFieldGenerator() {
+        return this.derivedFieldGenerator;
+    }
+
+    /**
+     * Method to determine, if it is possible to derive source for this field using field mapping parameters.
+     * DerivedFieldGenerator should be set for which derived source feature is supported, this behaviour can be
+     * overridden at a Mapper level by implementing this method
+     */
+    @Override
+    public void canDeriveSource() {
+        if (this.copyTo() != null && !this.copyTo().copyToFields().isEmpty()) {
+            throw new UnsupportedOperationException("Unable to derive source for fields with copy_to parameter set");
+        }
+        canDeriveSourceInternal();
+        if (getDerivedFieldGenerator() == null) {
+            throw new UnsupportedOperationException(
+                "Derive source is not supported for field [" + name() + "] with field " + "type [" + fieldType().typeName() + "]"
+            );
+        }
+    }
+
+    /**
+     * Must be overridden for each mapper for which derived source feature is supported
+     */
+    protected void canDeriveSourceInternal() {
+        throw new UnsupportedOperationException(
+            "Derive source is not supported for field [" + name() + "] with field " + "type [" + fieldType().typeName() + "]"
+        );
+    }
+
+    /**
+     * Validates if doc values is enabled for a field or not
+     */
+    protected void checkDocValuesForDerivedSource() {
+        if (!mappedFieldType.hasDocValues()) {
+            throw new UnsupportedOperationException("Unable to derive source for [" + name() + "] with doc values disabled");
+        }
+    }
+
+    /**
+     * Validates if stored field is enabled for a field or not
+     */
+    protected void checkStoredForDerivedSource() {
+        if (!mappedFieldType.isStored()) {
+            throw new UnsupportedOperationException("Unable to derive source for [" + name() + "] with store disabled");
+        }
+    }
+
+    /**
+     * Validates if doc_values or stored field is enabled for a field or not
+     */
+    protected void checkStoredAndDocValuesForDerivedSource() {
+        if (!mappedFieldType.isStored() && !mappedFieldType.hasDocValues()) {
+            throw new UnsupportedOperationException("Unable to derive source for [" + name() + "] with stored and " + "docValues disabled");
+        }
+    }
+
+    /**
+     * Method used for deriving source and building it to XContentBuilder object
+     * <p>
+     * Considerations:
+     *  1. If "null_value" is defined in field mapping and if ingested doc contains "null" field value then derived
+     *     source will contain "null_value" as a displayed field value instead of null and if "null_value" is not
+     *     defined in mapping then field itself will not be present in derived source
+     *
+     * @param builder - builder to store the derived source filed
+     * @param leafReader - leafReader to read data from
+     * @param docId - docId for which we want to derive the source
+     */
+    @Override
+    public void deriveSource(XContentBuilder builder, LeafReader leafReader, int docId) throws IOException {
+        derivedFieldGenerator.generate(builder, leafReader, docId);
+    }
+
+    /**
      * Multi field implementation used across field mappers
      *
      * @opensearch.api
@@ -636,6 +777,10 @@ public abstract class FieldMapper extends Mapper implements Cloneable {
                     final Map<String, FieldMapper> mappers = (Map<String, FieldMapper>) mapperBuilders;
                     return new MultiFields(mappers);
                 }
+            }
+
+            public Map<String, Mapper.Builder> getMapperBuilders() {
+                return mapperBuilders;
             }
         }
 

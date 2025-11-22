@@ -36,21 +36,22 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.action.support.ActionFilters;
+import org.opensearch.action.support.TransportIndicesResolvingAction;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
-import org.opensearch.action.support.master.AcknowledgedResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
-import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.MetadataUpdateSettingsService;
+import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.index.Index;
-import org.opensearch.index.IndexModule;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
@@ -59,14 +60,14 @@ import java.util.Arrays;
 import java.util.Set;
 import java.util.stream.Stream;
 
-import static org.opensearch.index.IndexModule.INDEX_STORE_TYPE_SETTING;
-
 /**
  * Transport action for updating index settings
  *
  * @opensearch.internal
  */
-public class TransportUpdateSettingsAction extends TransportClusterManagerNodeAction<UpdateSettingsRequest, AcknowledgedResponse> {
+public class TransportUpdateSettingsAction extends TransportClusterManagerNodeAction<UpdateSettingsRequest, AcknowledgedResponse>
+    implements
+        TransportIndicesResolvingAction<UpdateSettingsRequest> {
 
     private static final Logger logger = LogManager.getLogger(TransportUpdateSettingsAction.class);
 
@@ -121,9 +122,8 @@ public class TransportUpdateSettingsAction extends TransportClusterManagerNodeAc
             return globalBlock;
         }
         if (request.settings().size() == 1 &&  // we have to allow resetting these settings otherwise users can't unblock an index
-            IndexMetadata.INDEX_BLOCKS_METADATA_SETTING.exists(request.settings())
-            || IndexMetadata.INDEX_READ_ONLY_SETTING.exists(request.settings())
-            || IndexMetadata.INDEX_BLOCKS_READ_ONLY_ALLOW_DELETE_SETTING.exists(request.settings())) {
+            ClusterBlocks.INDEX_DATA_READ_ONLY_BLOCK_SETTINGS.stream()
+                .anyMatch(booleanSetting -> booleanSetting.exists(request.settings()))) {
             return null;
         }
 
@@ -133,9 +133,7 @@ public class TransportUpdateSettingsAction extends TransportClusterManagerNodeAc
         for (Index index : requestIndices) {
             if (state.blocks().indexBlocked(ClusterBlockLevel.METADATA_WRITE, index.getName())) {
                 allowSearchableSnapshotSettingsUpdate = allowSearchableSnapshotSettingsUpdate
-                    && IndexModule.Type.REMOTE_SNAPSHOT.match(
-                        state.getMetadata().getIndexSafe(index).getSettings().get(INDEX_STORE_TYPE_SETTING.getKey())
-                    );
+                    && state.getMetadata().getIndexSafe(index).isRemoteSnapshot();
             }
         }
         // check if all settings in the request are in the allow list
@@ -164,14 +162,14 @@ public class TransportUpdateSettingsAction extends TransportClusterManagerNodeAc
         final ClusterState state,
         final ActionListener<AcknowledgedResponse> listener
     ) {
-        final Index[] concreteIndices = indexNameExpressionResolver.concreteIndices(state, request);
+        final Index[] concreteIndices = resolveIndices(request, state).concreteIndicesAsArray();
         UpdateSettingsClusterStateUpdateRequest clusterStateUpdateRequest = new UpdateSettingsClusterStateUpdateRequest().indices(
             concreteIndices
         )
             .settings(request.settings())
             .setPreserveExisting(request.isPreserveExisting())
             .ackTimeout(request.timeout())
-            .masterNodeTimeout(request.clusterManagerNodeTimeout());
+            .clusterManagerNodeTimeout(request.clusterManagerNodeTimeout());
 
         updateSettingsService.updateSettings(clusterStateUpdateRequest, new ActionListener<ClusterStateUpdateResponse>() {
             @Override
@@ -185,5 +183,14 @@ public class TransportUpdateSettingsAction extends TransportClusterManagerNodeAc
                 listener.onFailure(t);
             }
         });
+    }
+
+    @Override
+    public ResolvedIndices resolveIndices(UpdateSettingsRequest request) {
+        return ResolvedIndices.of(resolveIndices(request, clusterService.state()));
+    }
+
+    private ResolvedIndices.Local.Concrete resolveIndices(UpdateSettingsRequest request, ClusterState clusterState) {
+        return indexNameExpressionResolver.concreteResolvedIndices(clusterState, request);
     }
 }

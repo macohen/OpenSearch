@@ -72,7 +72,7 @@ public final class RemoveProcessor extends AbstractProcessor {
     ) {
         super(tag, description);
         if (fields == null && excludeFields == null || fields != null && excludeFields != null) {
-            throw new IllegalArgumentException("ether fields and excludeFields must be set");
+            throw new IllegalArgumentException("either fields or excludeFields must be set");
         }
         if (fields != null) {
             this.fields = new ArrayList<>(fields);
@@ -188,13 +188,13 @@ public final class RemoveProcessor extends AbstractProcessor {
             final Object excludeField = ConfigurationUtils.readOptionalObject(config, "exclude_field");
 
             if (field == null && excludeField == null || field != null && excludeField != null) {
-                throw newConfigurationException(TYPE, processorTag, "field", "ether field or exclude_field must be set");
+                throw newConfigurationException(TYPE, processorTag, "field", "either field or exclude_field must be set");
             }
 
             boolean ignoreMissing = ConfigurationUtils.readBooleanProperty(TYPE, processorTag, config, "ignore_missing", false);
 
             if (field != null) {
-                if (field instanceof List) {
+                if (field instanceof List<?>) {
                     @SuppressWarnings("unchecked")
                     List<String> stringList = (List<String>) field;
                     fields.addAll(stringList);
@@ -206,7 +206,7 @@ public final class RemoveProcessor extends AbstractProcessor {
                     .collect(Collectors.toList());
                 return new RemoveProcessor(processorTag, description, fieldCompiledTemplates, null, ignoreMissing);
             } else {
-                if (excludeField instanceof List) {
+                if (excludeField instanceof List<?>) {
                     @SuppressWarnings("unchecked")
                     List<String> stringList = (List<String>) excludeField;
                     excludeFields.addAll(stringList);

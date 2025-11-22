@@ -44,6 +44,7 @@ import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.ConjunctionUtils;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.IndexSearcher;
@@ -54,6 +55,7 @@ import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
+import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.TermStatistics;
 import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.search.TotalHits;
@@ -62,14 +64,21 @@ import org.apache.lucene.search.similarities.Similarity;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.Bits;
-import org.apache.lucene.util.CombinedBitSet;
 import org.apache.lucene.util.SparseFixedBitSet;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.lease.Releasable;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.common.lucene.search.TopDocsAndMaxScore;
+import org.opensearch.lucene.util.CombinedBitSet;
 import org.opensearch.search.DocValueFormat;
+import org.opensearch.search.SearchHits;
 import org.opensearch.search.SearchService;
+import org.opensearch.search.aggregations.InternalAggregation;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.approximate.ApproximateScoreQuery;
 import org.opensearch.search.dfs.AggregatedDfs;
+import org.opensearch.search.fetch.FetchSearchResult;
+import org.opensearch.search.fetch.QueryFetchSearchResult;
 import org.opensearch.search.profile.ContextualProfileBreakdown;
 import org.opensearch.search.profile.Timer;
 import org.opensearch.search.profile.query.ProfileWeight;
@@ -79,6 +88,7 @@ import org.opensearch.search.query.QueryPhase;
 import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.search.sort.FieldSortBuilder;
 import org.opensearch.search.sort.MinAndMax;
+import org.opensearch.search.streaming.FlushMode;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -153,6 +163,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         this.profiler = profiler;
     }
 
+    public QueryProfiler getProfiler() {
+        return profiler;
+    }
+
     /**
      * Add a {@link Runnable} that will be run on a regular basis while accessing documents in the
      * DirectoryReader but also while collecting them and check for query cancellation or timeout.
@@ -188,6 +202,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
     @Override
     public Query rewrite(Query original) throws IOException {
+        if (original instanceof ApproximateScoreQuery approximateScoreQuery) {
+            approximateScoreQuery.setContext(searchContext);
+        }
         if (profiler != null) {
             profiler.startRewriteTime();
         }
@@ -207,7 +224,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             // createWeight() is called for each query in the tree, so we tell the queryProfiler
             // each invocation so that it can build an internal representation of the query
             // tree
-            ContextualProfileBreakdown<QueryTimingType> profile = profiler.getQueryBreakdown(query);
+            ContextualProfileBreakdown profile = profiler.getQueryBreakdown(query);
             Timer timer = profile.getTimer(QueryTimingType.CREATE_WEIGHT);
             timer.start();
             final Weight weight;
@@ -234,9 +251,10 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         final List<Collector> collectors = new ArrayList<>(leaves.size());
         for (LeafReaderContext ctx : leaves) {
             final Collector collector = manager.newCollector();
-            searchLeaf(ctx, weight, collector);
+            searchLeaf(ctx, 0, DocIdSetIterator.NO_MORE_DOCS, weight, collector);
             collectors.add(collector);
         }
+
         TopFieldDocs mergedTopDocs = (TopFieldDocs) manager.reduce(collectors);
         // Lucene sets shards indexes during merging of topDocs from different collectors
         // We need to reset shard index; OpenSearch will set shard index later during reduce stage
@@ -247,6 +265,19 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             mergedTopDocs = new TopFieldDocs(totalHits, mergedTopDocs.scoreDocs, mergedTopDocs.fields);
         }
         result.topDocs(new TopDocsAndMaxScore(mergedTopDocs, Float.NaN), formats);
+    }
+
+    @Override
+    public void search(Query query, Collector collector) throws IOException {
+        // TODO : Remove when switching to use the @org.apache.lucene.search.IndexSearcher#search(Query, CollectorManager) variant from
+        // @org.opensearch.search.query.QueryPhase#searchWithCollector which then calls the overridden
+        // search(LeafReaderContextPartition[] partitions, Weight weight, Collector collector)
+        query = collector.scoreMode().needsScores() ? rewrite(query) : rewrite(new ConstantScoreQuery(query));
+        Weight weight = createWeight(query, collector.scoreMode(), 1);
+        LeafReaderContextPartition[] partitions = (getLeafContexts() == null)
+            ? new LeafReaderContextPartition[0]
+            : getLeafContexts().stream().map(LeafReaderContextPartition::createForEntireSegment).toArray(LeafReaderContextPartition[]::new);
+        search(partitions, weight, collector);
     }
 
     public void search(
@@ -269,21 +300,29 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     }
 
     @Override
-    protected void search(List<LeafReaderContext> leaves, Weight weight, Collector collector) throws IOException {
-        // Time series based workload by default traverses segments in desc order i.e. latest to the oldest order.
-        // This is actually beneficial for search queries to start search on latest segments first for time series workload.
-        // That can slow down ASC order queries on timestamp workload. So to avoid that slowdown, we will reverse leaf
-        // reader order here.
-        if (searchContext.shouldUseTimeSeriesDescSortOptimization()) {
-            for (int i = leaves.size() - 1; i >= 0; i--) {
-                searchLeaf(leaves.get(i), weight, collector);
+    protected void search(LeafReaderContextPartition[] partitions, Weight weight, Collector collector) throws IOException {
+        searchContext.indexShard().getSearchOperationListener().onPreSliceExecution(searchContext);
+        try {
+            // Time series based workload by default traverses segments in desc order i.e. latest to the oldest order.
+            // This is actually beneficial for search queries to start search on latest segments first for time series workload.
+            // That can slow down ASC order queries on timestamp workload. So to avoid that slowdown, we will reverse leaf
+            // reader order here.
+            if (searchContext.shouldUseTimeSeriesDescSortOptimization()) {
+                for (int i = partitions.length - 1; i >= 0; i--) {
+                    searchLeaf(partitions[i].ctx, partitions[i].minDocId, partitions[i].maxDocId, weight, collector);
+                }
+            } else {
+                for (LeafReaderContextPartition partition : partitions) {
+                    searchLeaf(partition.ctx, partition.minDocId, partition.maxDocId, weight, collector);
+                }
             }
-        } else {
-            for (int i = 0; i < leaves.size(); i++) {
-                searchLeaf(leaves.get(i), weight, collector);
-            }
+            // TODO : Make this a responsibility for the callers rather than implicitly getting it done here ?
+            searchContext.bucketCollectorProcessor().processPostCollection(collector);
+        } catch (Throwable t) {
+            searchContext.indexShard().getSearchOperationListener().onFailedSliceExecution(searchContext);
+            throw t;
         }
-        searchContext.bucketCollectorProcessor().processPostCollection(collector);
+        searchContext.indexShard().getSearchOperationListener().onSliceExecution(searchContext);
     }
 
     /**
@@ -292,7 +331,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
      * {@link LeafCollector#collect(int)} is called for every matching document in
      * the provided <code>ctx</code>.
      */
-    private void searchLeaf(LeafReaderContext ctx, Weight weight, Collector collector) throws IOException {
+    @Override
+    protected void searchLeaf(LeafReaderContext ctx, int minDocId, int maxDocId, Weight weight, Collector collector) throws IOException {
 
         // Check if at all we need to call this leaf for collecting results.
         if (canMatch(ctx) == false) {
@@ -302,8 +342,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         final LeafCollector leafCollector;
         try {
             cancellable.checkCancelled();
-            if (weight instanceof ProfileWeight) {
-                ((ProfileWeight) weight).associateCollectorToLeaves(ctx, collector);
+            if (weight instanceof ProfileWeight profileWeight) {
+                profileWeight.associateCollectorToLeaves(ctx, collector);
             }
             weight = wrapWeight(weight);
             // See please https://github.com/apache/lucene/pull/964
@@ -324,7 +364,7 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             BulkScorer bulkScorer = weight.bulkScorer(ctx);
             if (bulkScorer != null) {
                 try {
-                    bulkScorer.score(leafCollector, liveDocs);
+                    bulkScorer.score(leafCollector, liveDocs, minDocId, maxDocId);
                 } catch (CollectionTerminatedException e) {
                     // collection was terminated prematurely
                     // continue with the following leaf
@@ -342,6 +382,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                         scorer,
                         liveDocsBitSet,
                         leafCollector,
+                        minDocId,
+                        maxDocId,
                         this.cancellable.isEnabled() ? cancellable::checkCancelled : () -> {}
                     );
                 } catch (CollectionTerminatedException e) {
@@ -354,9 +396,42 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
             }
         }
 
+        if (searchContext.isStreamSearch() && searchContext.getFlushMode() == FlushMode.PER_SEGMENT) {
+            logger.debug(
+                "Stream intermediate aggregation for segment [{}], shard [{}]",
+                ctx.ord,
+                searchContext.shardTarget().getShardId().id()
+            );
+            List<InternalAggregation> internalAggregation = searchContext.bucketCollectorProcessor().buildAggBatch(collector);
+            if (!internalAggregation.isEmpty()) {
+                sendBatch(internalAggregation);
+            }
+        }
+
         // Note: this is called if collection ran successfully, including the above special cases of
         // CollectionTerminatedException and TimeExceededException, but no other exception.
         leafCollector.finish();
+    }
+
+    void sendBatch(List<InternalAggregation> batch) {
+        InternalAggregations batchAggResult = new InternalAggregations(batch);
+
+        final QuerySearchResult queryResult = searchContext.queryResult();
+        // clone the query result to avoid issue in concurrent scenario
+        final QuerySearchResult cloneResult = new QuerySearchResult(
+            queryResult.getContextId(),
+            queryResult.getSearchShardTarget(),
+            queryResult.getShardSearchRequest()
+        );
+        cloneResult.aggregations(batchAggResult);
+        // set a dummy topdocs
+        cloneResult.topDocs(new TopDocsAndMaxScore(Lucene.EMPTY_TOP_DOCS, Float.NaN), new DocValueFormat[0]);
+        // set a dummy fetch
+        final FetchSearchResult fetchResult = searchContext.fetchResult();
+        fetchResult.hits(SearchHits.empty());
+        final QueryFetchSearchResult result = new QueryFetchSearchResult(cloneResult, fetchResult);
+        // flush back
+        searchContext.getStreamChannelListener().onStreamResponse(result, false);
     }
 
     private Weight wrapWeight(Weight weight) {
@@ -374,18 +449,48 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
                 }
 
                 @Override
-                public Scorer scorer(LeafReaderContext context) throws IOException {
-                    return weight.scorer(context);
+                public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
+                    return new ScorerSupplier() {
+                        private Scorer scorer;
+                        private BulkScorer bulkScorer;
+
+                        @Override
+                        public Scorer get(long leadCost) throws IOException {
+                            scorer = weight.scorer(context);
+                            return scorer;
+                        }
+
+                        @Override
+                        public BulkScorer bulkScorer() throws IOException {
+                            final BulkScorer in = weight.bulkScorer(context);
+
+                            if (in != null) {
+                                bulkScorer = new CancellableBulkScorer(in, cancellable::checkCancelled);
+                            } else {
+                                bulkScorer = null;
+                            }
+
+                            return bulkScorer;
+                        }
+
+                        @Override
+                        public long cost() {
+                            if (scorer != null) {
+                                return scorer.iterator().cost();
+                            } else if (bulkScorer != null) {
+                                return bulkScorer.cost();
+                            } else {
+                                // We have no prior knowledge of how many docs might match for any given query term,
+                                // so we assume that all docs could be a match.
+                                return Integer.MAX_VALUE;
+                            }
+                        }
+                    };
                 }
 
                 @Override
-                public BulkScorer bulkScorer(LeafReaderContext context) throws IOException {
-                    BulkScorer in = weight.bulkScorer(context);
-                    if (in != null) {
-                        return new CancellableBulkScorer(in, cancellable::checkCancelled);
-                    } else {
-                        return null;
-                    }
+                public int count(LeafReaderContext context) throws IOException {
+                    return weight.count(context);
                 }
             };
         } else {
@@ -396,9 +501,9 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
     private static BitSet getSparseBitSetOrNull(Bits liveDocs) {
         if (liveDocs instanceof SparseFixedBitSet) {
             return (BitSet) liveDocs;
-        } else if (liveDocs instanceof CombinedBitSet
+        } else if (liveDocs instanceof CombinedBitSet combinedBitSet
             // if the underlying role bitset is sparse
-            && ((CombinedBitSet) liveDocs).getFirst() instanceof SparseFixedBitSet) {
+            && combinedBitSet.getFirst() instanceof SparseFixedBitSet) {
                 return (BitSet) liveDocs;
             } else {
                 return null;
@@ -408,6 +513,17 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
 
     static void intersectScorerAndBitSet(Scorer scorer, BitSet acceptDocs, LeafCollector collector, Runnable checkCancelled)
         throws IOException {
+        intersectScorerAndBitSet(scorer, acceptDocs, collector, 0, DocIdSetIterator.NO_MORE_DOCS, checkCancelled);
+    }
+
+    private static void intersectScorerAndBitSet(
+        Scorer scorer,
+        BitSet acceptDocs,
+        LeafCollector collector,
+        int minDocId,
+        int maxDocId,
+        Runnable checkCancelled
+    ) throws IOException {
         collector.setScorer(scorer);
         // ConjunctionDISI uses the DocIdSetIterator#cost() to order the iterators, so if roleBits has the lowest cardinality it should
         // be used first:
@@ -416,7 +532,8 @@ public class ContextIndexSearcher extends IndexSearcher implements Releasable {
         );
         int seen = 0;
         checkCancelled.run();
-        for (int docId = iterator.nextDoc(); docId < DocIdSetIterator.NO_MORE_DOCS; docId = iterator.nextDoc()) {
+        iterator.advance(minDocId);
+        for (int docId = iterator.docID(); docId < maxDocId; docId = iterator.nextDoc()) {
             if (++seen % CHECK_CANCELLED_SCORER_INTERVAL == 0) {
                 checkCancelled.run();
             }

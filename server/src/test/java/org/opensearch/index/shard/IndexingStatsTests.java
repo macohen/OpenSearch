@@ -105,7 +105,9 @@ public class IndexingStatsTests extends OpenSearchTestCase {
             + counter[3]
             + ",\"5xx\":"
             + counter[4]
-            + "}}}";
+            + "},\"max_last_index_request_timestamp\":"
+            + totalStats.getMaxLastIndexRequestTimestamp()
+            + "}}";
 
         XContentBuilder xContentBuilder = MediaTypeRegistry.contentBuilder(MediaTypeRegistry.JSON);
         xContentBuilder.startObject();
@@ -115,25 +117,107 @@ public class IndexingStatsTests extends OpenSearchTestCase {
         assertEquals(expected, xContentBuilder.toString());
     }
 
+    /**
+     * Tests aggregation logic for maxLastIndexRequestTimestamp in IndexingStats.Stats.
+     * Uses reflection because the field is private and not settable via public API.
+     * This ensures that aggregation (add) always surfaces the maximum value, even across multiple adds and random values.
+     */
+    public void testMaxLastIndexRequestTimestampAggregation() throws Exception {
+        // Use explicit values for all fields except the timestamp
+        IndexingStats.Stats.DocStatusStats docStatusStats = new IndexingStats.Stats.DocStatusStats();
+        long ts1 = randomLongBetween(0, 1000000);
+        long ts2 = randomLongBetween(0, 1000000);
+        long ts3 = randomLongBetween(0, 1000000);
+        IndexingStats.Stats.Builder defaultStats = new IndexingStats.Stats.Builder().indexCount(1)
+            .indexTimeInMillis(2)
+            .indexCurrent(3)
+            .indexFailedCount(4)
+            .deleteCount(5)
+            .deleteTimeInMillis(6)
+            .deleteCurrent(7)
+            .noopUpdateCount(8)
+            .isThrottled(false)
+            .throttleTimeInMillis(9)
+            .docStatusStats(docStatusStats);
+        IndexingStats.Stats stats1 = defaultStats.maxLastIndexRequestTimestamp(ts1).build();
+        IndexingStats.Stats stats2 = defaultStats.maxLastIndexRequestTimestamp(ts2).build();
+        IndexingStats.Stats stats3 = defaultStats.maxLastIndexRequestTimestamp(ts3).build();
+
+        // Aggregate stats1 + stats2
+        stats1.add(stats2);
+        assertEquals(Math.max(ts1, ts2), stats1.getMaxLastIndexRequestTimestamp());
+
+        // Aggregate stats1 + stats3
+        stats1.add(stats3);
+        assertEquals(Math.max(Math.max(ts1, ts2), ts3), stats1.getMaxLastIndexRequestTimestamp());
+
+        // Test with zero and negative values
+        IndexingStats.Stats statsZero = defaultStats.maxLastIndexRequestTimestamp(0L).build();
+        IndexingStats.Stats statsNeg = defaultStats.maxLastIndexRequestTimestamp(-100L).build();
+
+        statsZero.add(statsNeg);
+        assertEquals(0L, statsZero.getMaxLastIndexRequestTimestamp());
+
+        IndexingStats.Stats statsNeg2 = defaultStats.maxLastIndexRequestTimestamp(-50L).build();
+        statsNeg.add(statsNeg2);
+        assertEquals(-50L, statsNeg.getMaxLastIndexRequestTimestamp());
+    }
+
+    public void testMaxLastIndexRequestTimestampBackwardCompatibility() throws IOException {
+        IndexingStats.Stats.DocStatusStats docStatusStats = new IndexingStats.Stats.DocStatusStats();
+        long ts = randomLongBetween(0, 1000000);
+        IndexingStats.Stats stats = new IndexingStats.Stats.Builder().indexCount(1)
+            .indexTimeInMillis(2)
+            .indexCurrent(3)
+            .indexFailedCount(4)
+            .deleteCount(5)
+            .deleteTimeInMillis(6)
+            .deleteCurrent(7)
+            .noopUpdateCount(8)
+            .isThrottled(false)
+            .throttleTimeInMillis(9)
+            .docStatusStats(docStatusStats)
+            .maxLastIndexRequestTimestamp(ts)
+            .build();
+
+        // Serialize with V_3_1_0 (should include the field)
+        BytesStreamOutput outNew = new BytesStreamOutput();
+        outNew.setVersion(org.opensearch.Version.V_3_2_0);
+        stats.writeTo(outNew);
+        StreamInput inNew = outNew.bytes().streamInput();
+        inNew.setVersion(org.opensearch.Version.V_3_2_0);
+        IndexingStats.Stats deserializedNew = new IndexingStats.Stats(inNew);
+        assertEquals(ts, deserializedNew.getMaxLastIndexRequestTimestamp());
+
+        // Serialize with V_2_11_0 (should NOT include the field, should default to 0)
+        BytesStreamOutput outOld = new BytesStreamOutput();
+        outOld.setVersion(org.opensearch.Version.V_2_11_0);
+        stats.writeTo(outOld);
+        StreamInput inOld = outOld.bytes().streamInput();
+        inOld.setVersion(org.opensearch.Version.V_2_11_0);
+        IndexingStats.Stats deserializedOld = new IndexingStats.Stats(inOld);
+        assertEquals(0L, deserializedOld.getMaxLastIndexRequestTimestamp());
+    }
+
     private IndexingStats createTestInstance() {
         IndexingStats.Stats.DocStatusStats docStatusStats = new IndexingStats.Stats.DocStatusStats();
         for (int i = 1; i < 6; ++i) {
             docStatusStats.add(RestStatus.fromCode(i * 100), randomNonNegativeLong());
         }
 
-        IndexingStats.Stats stats = new IndexingStats.Stats(
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomNonNegativeLong(),
-            randomBoolean(),
-            randomNonNegativeLong(),
-            docStatusStats
-        );
+        IndexingStats.Stats stats = new IndexingStats.Stats.Builder().indexCount(randomNonNegativeLong())
+            .indexTimeInMillis(randomNonNegativeLong())
+            .indexCurrent(randomNonNegativeLong())
+            .indexFailedCount(randomNonNegativeLong())
+            .deleteCount(randomNonNegativeLong())
+            .deleteTimeInMillis(randomNonNegativeLong())
+            .deleteCurrent(randomNonNegativeLong())
+            .noopUpdateCount(randomNonNegativeLong())
+            .isThrottled(randomBoolean())
+            .throttleTimeInMillis(randomNonNegativeLong())
+            .docStatusStats(docStatusStats)
+            .maxLastIndexRequestTimestamp(randomLong())
+            .build();
 
         return new IndexingStats(stats);
     }

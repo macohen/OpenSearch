@@ -25,8 +25,6 @@ import java.util.Optional;
 
 /**
  * Internal Realm is a custom realm using the internal OpenSearch IdP
- *
- * @opensearch.experimental
  */
 public class OpenSearchRealm extends AuthenticatingRealm {
     private static final String DEFAULT_REALM_NAME = "internal";
@@ -93,7 +91,7 @@ public class OpenSearchRealm extends AuthenticatingRealm {
     public User getInternalUser(final String principalIdentifier) throws UnknownAccountException {
         final User userRecord = internalUsers.get(principalIdentifier);
         if (userRecord == null) {
-            throw new UnknownAccountException();
+            throw new UnknownAccountException("Incorrect credentials");
         }
         return userRecord;
     }
@@ -107,8 +105,8 @@ public class OpenSearchRealm extends AuthenticatingRealm {
      */
     @Override
     protected AuthenticationInfo doGetAuthenticationInfo(final AuthenticationToken token) throws AuthenticationException {
-        if (token instanceof UsernamePasswordToken) {
-            final String username = ((UsernamePasswordToken) token).getUsername();
+        if (token instanceof UsernamePasswordToken t) {
+            final String username = t.getUsername();
             // Look up the user by the provide username
             final User userRecord = getInternalUser(username);
             // TODO: Check for other things, like a locked account, expired password, etc.
@@ -131,7 +129,7 @@ public class OpenSearchRealm extends AuthenticatingRealm {
                 return sai;
             } else {
                 // Bad password
-                throw new IncorrectCredentialsException();
+                throw new IncorrectCredentialsException("Incorrect credentials");
             }
         }
 

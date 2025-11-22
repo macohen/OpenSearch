@@ -36,7 +36,6 @@ import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.test.ParameterizedStaticSettingsOpenSearchIntegTestCase;
 
 import java.util.Arrays;
@@ -60,11 +59,6 @@ public class SimilarityIT extends ParameterizedStaticSettingsOpenSearchIntegTest
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), false).build() },
             new Object[] { Settings.builder().put(CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING.getKey(), true).build() }
         );
-    }
-
-    @Override
-    protected Settings featureFlagSettings() {
-        return Settings.builder().put(super.featureFlagSettings()).put(FeatureFlags.CONCURRENT_SEGMENT_SEARCH, "true").build();
     }
 
     public void testCustomBM25Similarity() throws Exception {
@@ -113,14 +107,14 @@ public class SimilarityIT extends ParameterizedStaticSettingsOpenSearchIntegTest
             .setQuery(matchQuery("field1", "quick brown fox"))
             .execute()
             .actionGet();
-        assertThat(bm25SearchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(bm25SearchResponse.getHits().getTotalHits().value(), equalTo(1L));
         float bm25Score = bm25SearchResponse.getHits().getHits()[0].getScore();
 
         SearchResponse booleanSearchResponse = client().prepareSearch()
             .setQuery(matchQuery("field2", "quick brown fox"))
             .execute()
             .actionGet();
-        assertThat(booleanSearchResponse.getHits().getTotalHits().value, equalTo(1L));
+        assertThat(booleanSearchResponse.getHits().getTotalHits().value(), equalTo(1L));
         float defaultScore = booleanSearchResponse.getHits().getHits()[0].getScore();
 
         assertThat(bm25Score, not(equalTo(defaultScore)));

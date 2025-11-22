@@ -32,16 +32,28 @@
 
 package org.opensearch.index.query;
 
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.store.Directory;
+import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParseException;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.search.approximate.ApproximateMatchAllQuery;
+import org.opensearch.search.approximate.ApproximateScoreQuery;
+import org.opensearch.search.internal.ContextIndexSearcher;
+import org.opensearch.search.internal.SearchContext;
 import org.opensearch.test.AbstractQueryTestCase;
 import org.hamcrest.Matchers;
 
@@ -60,6 +72,7 @@ import static org.opensearch.index.query.QueryBuilders.termQuery;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.instanceOf;
+import static org.mockito.Mockito.mock;
 
 public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilder> {
     @Override
@@ -93,7 +106,8 @@ public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilde
     @Override
     protected void doAssertLuceneQuery(BoolQueryBuilder queryBuilder, Query query, QueryShardContext context) throws IOException {
         if (!queryBuilder.hasClauses()) {
-            assertThat(query, instanceOf(MatchAllDocsQuery.class));
+            assertThat(query, instanceOf(ApproximateScoreQuery.class));
+            assertThat(((ApproximateScoreQuery) query).getOriginalQuery(), instanceOf(MatchAllDocsQuery.class));
         } else {
             List<BooleanClause> clauses = new ArrayList<>();
             clauses.addAll(getBooleanClauses(queryBuilder.must(), BooleanClause.Occur.MUST, context));
@@ -102,7 +116,8 @@ public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilde
             clauses.addAll(getBooleanClauses(queryBuilder.filter(), BooleanClause.Occur.FILTER, context));
 
             if (clauses.isEmpty()) {
-                assertThat(query, instanceOf(MatchAllDocsQuery.class));
+                assertThat(query, instanceOf(ApproximateScoreQuery.class));
+                assertThat(((ApproximateScoreQuery) query).getOriginalQuery(), instanceOf(MatchAllDocsQuery.class));
             } else if (query instanceof MatchNoDocsQuery == false) {
                 assertThat(query, instanceOf(BooleanQuery.class));
                 BooleanQuery booleanQuery = (BooleanQuery) query;
@@ -178,7 +193,6 @@ public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilde
         BoolQueryBuilder booleanQuery = new BoolQueryBuilder();
         expectThrows(IllegalArgumentException.class, () -> booleanQuery.must(null));
         expectThrows(IllegalArgumentException.class, () -> booleanQuery.mustNot(null));
-        expectThrows(IllegalArgumentException.class, () -> booleanQuery.filter(null));
         expectThrows(IllegalArgumentException.class, () -> booleanQuery.should(null));
     }
 
@@ -201,15 +215,18 @@ public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilde
         assertThat(booleanQuery.getMinimumNumberShouldMatch(), equalTo(0));
         assertThat(booleanQuery.clauses().size(), equalTo(1));
         BooleanClause booleanClause = booleanQuery.clauses().get(0);
-        assertThat(booleanClause.getOccur(), equalTo(BooleanClause.Occur.FILTER));
-        assertThat(booleanClause.getQuery(), instanceOf(BooleanQuery.class));
-        BooleanQuery innerBooleanQuery = (BooleanQuery) booleanClause.getQuery();
+        assertThat(booleanClause.occur(), equalTo(BooleanClause.Occur.FILTER));
+        assertThat(booleanClause.query(), instanceOf(BooleanQuery.class));
+        BooleanQuery innerBooleanQuery = (BooleanQuery) booleanClause.query();
         // we didn't set minimum should match initially, there are no should clauses so it should be 0
         assertThat(innerBooleanQuery.getMinimumNumberShouldMatch(), equalTo(0));
         assertThat(innerBooleanQuery.clauses().size(), equalTo(1));
         BooleanClause innerBooleanClause = innerBooleanQuery.clauses().get(0);
-        assertThat(innerBooleanClause.getOccur(), equalTo(BooleanClause.Occur.MUST));
-        assertThat(innerBooleanClause.getQuery(), instanceOf(MatchAllDocsQuery.class));
+        assertThat(innerBooleanClause.occur(), equalTo(BooleanClause.Occur.MUST));
+        assertThat(innerBooleanClause.query(), instanceOf(ApproximateScoreQuery.class));
+        ApproximateScoreQuery approxQuery = (ApproximateScoreQuery) innerBooleanClause.query();
+        assertThat(approxQuery.getOriginalQuery(), instanceOf(MatchAllDocsQuery.class));
+        assertThat(approxQuery.getApproximationQuery(), instanceOf(ApproximateMatchAllQuery.class));
     }
 
     public void testMinShouldMatchBiggerThanNumberOfShouldClauses() throws Exception {
@@ -324,6 +341,23 @@ public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilde
         String query = "{\"bool\" : {\"filter\" : null } }";
         BoolQueryBuilder builder = (BoolQueryBuilder) parseQuery(query);
         assertTrue(builder.filter().isEmpty());
+    }
+
+    /**
+     * Check if a filter can be applied to the BoolQuery
+     * @throws IOException
+     */
+    public void testFilter() throws IOException {
+        // Test for non null filter
+        String query = "{\"bool\" : {\"filter\" : null } }";
+        QueryBuilder filter = QueryBuilders.matchAllQuery();
+        BoolQueryBuilder builder = (BoolQueryBuilder) parseQuery(query);
+        assertFalse(builder.filter(filter).filter().isEmpty());
+        assertEquals(builder.filter(filter).filter().get(0), filter);
+
+        // Test for null filter case
+        builder = (BoolQueryBuilder) parseQuery(query);
+        assertTrue(builder.filter(null).filter().isEmpty());
     }
 
     /**
@@ -480,5 +514,113 @@ public class BoolQueryBuilderTests extends AbstractQueryTestCase<BoolQueryBuilde
 
         assertEquals(0, set.size());
 
+    }
+
+    public void testMultipleComplementAwareOnSameFieldNotRewritten() throws Exception {
+        Directory dir = newDirectory();
+        IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new StandardAnalyzer()));
+        addDocument(w, INT_FIELD_NAME, 1);
+        DirectoryReader reader = DirectoryReader.open(w);
+        IndexSearcher searcher = getIndexSearcher(reader);
+
+        BoolQueryBuilder qb = new BoolQueryBuilder();
+        // Test a field with two ranges is not rewritten
+        QueryBuilder rq1of2 = new RangeQueryBuilder(INT_FIELD_NAME).gt(10).lt(20);
+        QueryBuilder rq2of2 = new RangeQueryBuilder(INT_FIELD_NAME).gt(30).lt(40);
+        qb.mustNot(rq1of2);
+        qb.mustNot(rq2of2);
+        BoolQueryBuilder rewritten = (BoolQueryBuilder) Rewriteable.rewrite(qb, createShardContext(searcher));
+
+        assertTrue(rewritten.mustNot().contains(rq1of2));
+        assertTrue(rewritten.mustNot().contains(rq2of2));
+        assertEquals(0, rewritten.should().size());
+
+        // Similarly 1 range query and 1 match query on the same field shouldn't be rewritten
+        qb = new BoolQueryBuilder();
+        qb.mustNot(rq1of2);
+        QueryBuilder matchQuery = new MatchQueryBuilder(INT_FIELD_NAME, 200);
+        qb.mustNot(matchQuery);
+        rewritten = (BoolQueryBuilder) Rewriteable.rewrite(qb, createShardContext(searcher));
+        assertTrue(rewritten.mustNot().contains(rq1of2));
+        assertTrue(rewritten.mustNot().contains(matchQuery));
+        assertEquals(0, rewritten.should().size());
+
+        IOUtils.close(w, reader, dir);
+    }
+
+    public void testMustNotRewriteDisabledWithoutLeafReaders() throws Exception {
+        // If we don't have access the LeafReaderContexts, don't perform the must_not rewrite
+        int from = 10;
+        int to = 20;
+
+        BoolQueryBuilder qb = new BoolQueryBuilder();
+        QueryBuilder rq = getRangeQueryBuilder(INT_FIELD_NAME, from, to, true, true);
+        qb.mustNot(rq);
+
+        // Context has no searcher available --> no leaf readers available
+        BoolQueryBuilder rewritten = (BoolQueryBuilder) Rewriteable.rewrite(qb, createShardContext());
+        assertTrue(rewritten.mustNot().contains(rq));
+    }
+
+    public void testMustNotRewriteDisabledWithoutExactlyOneValuePerDoc() throws Exception {
+        // If the PointValues returned don't show exactly 1 value per doc, don't perform the must_not rewrite
+        int from = 10;
+        int to = 20;
+        Directory dir = newDirectory();
+        IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(new StandardAnalyzer()));
+        addDocument(w, INT_FIELD_NAME, 1, 2, 3); // This doc will have 3 values, so the rewrite shouldn't happen
+        addDocument(w, INT_FIELD_NAME, 1);
+        DirectoryReader reader = DirectoryReader.open(w);
+        IndexSearcher searcher = getIndexSearcher(reader);
+
+        BoolQueryBuilder qb = new BoolQueryBuilder();
+        QueryBuilder rq = getRangeQueryBuilder(INT_FIELD_NAME, from, to, true, true);
+        qb.mustNot(rq);
+
+        BoolQueryBuilder rewritten = (BoolQueryBuilder) Rewriteable.rewrite(qb, createShardContext(searcher));
+        assertTrue(rewritten.mustNot().contains(rq));
+
+        IOUtils.close(w, reader, dir);
+    }
+
+    private QueryBuilder getRangeQueryBuilder(String fieldName, Integer lower, Integer upper, boolean includeLower, boolean includeUpper) {
+        RangeQueryBuilder rq = new RangeQueryBuilder(fieldName);
+        if (lower != null) {
+            if (includeLower) {
+                rq.gte(lower);
+            } else {
+                rq.gt(lower);
+            }
+        }
+        if (upper != null) {
+            if (includeUpper) {
+                rq.lte(upper);
+            } else {
+                rq.lt(upper);
+            }
+        }
+        return rq;
+    }
+
+    private void addDocument(IndexWriter w, String fieldName, int... values) throws Exception {
+        Document d = new Document();
+        for (int value : values) {
+            d.add(new IntPoint(fieldName, value));
+        }
+        w.addDocument(d);
+        w.commit();
+    }
+
+    static IndexSearcher getIndexSearcher(DirectoryReader reader) throws Exception {
+        SearchContext searchContext = mock(SearchContext.class);
+        return new ContextIndexSearcher(
+            reader,
+            IndexSearcher.getDefaultSimilarity(),
+            IndexSearcher.getDefaultQueryCache(),
+            IndexSearcher.getDefaultQueryCachingPolicy(),
+            true,
+            null,
+            searchContext
+        );
     }
 }
