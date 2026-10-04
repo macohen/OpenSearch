@@ -32,6 +32,8 @@
 
 package org.opensearch.index.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
@@ -97,9 +99,12 @@ import static org.opensearch.index.search.QueryParserHelper.resolveMappingFields
  * @opensearch.internal
  */
 public class QueryStringQueryParser extends XQueryParser {
+    private static final Logger logger = LogManager.getLogger(QueryStringQueryParser.class);
     private static final String EXISTS_FIELD = "_exists_";
     @SuppressWarnings("NonFinalStaticField")
     private static int maxQueryStringLength = SearchService.SEARCH_MAX_QUERY_STRING_LENGTH.get(Settings.EMPTY);
+    private static boolean maxQueryStringLengthMonitorMode = SearchService.SEARCH_MAX_QUERY_STRING_LENGTH_MONITOR_ONLY.get(Settings.EMPTY);
+    private static int maxQueryNestingDepth = SearchService.SEARCH_MAX_QUERY_NESTING_DEPTH.get(Settings.EMPTY);
 
     private final QueryShardContext context;
     private final Map<String, Float> fieldsAndWeights;
@@ -871,17 +876,67 @@ public class QueryStringQueryParser extends XQueryParser {
         if (query.trim().isEmpty()) {
             return Queries.newMatchNoDocsQuery("Matching no documents because no terms present");
         }
-        if (query.length() > maxQueryStringLength) {
+        // Check parenthesis nesting depth before delegating to Lucene's recursive-descent parser.
+        // Deep nesting can cause StackOverflowError due to Lucene's recursive grammar productions.
+        int nestingDepth = maxParenthesisNestingDepth(query);
+        if (nestingDepth > maxQueryNestingDepth) {
             throw new ParseException(
-                "Query string length exceeds max allowed length "
-                    + maxQueryStringLength
+                "Query string parenthesis nesting depth exceeds max allowed depth "
+                    + maxQueryNestingDepth
                     + " ("
-                    + SearchService.SEARCH_MAX_QUERY_STRING_LENGTH.getKey()
-                    + "); actual length: "
-                    + query.length()
+                    + SearchService.SEARCH_MAX_QUERY_NESTING_DEPTH.getKey()
+                    + "); actual depth: "
+                    + nestingDepth
             );
         }
+        if (query.length() > maxQueryStringLength) {
+            if (maxQueryStringLengthMonitorMode) {
+                // Log a warning and continue
+                logger.warn(
+                    "Query string length exceeds max allowed length {} ({}); actual length: {}",
+                    maxQueryStringLength,
+                    SearchService.SEARCH_MAX_QUERY_STRING_LENGTH.getKey(),
+                    query.length()
+                );
+            } else {
+                throw new ParseException(
+                    "Query string length exceeds max allowed length "
+                        + maxQueryStringLength
+                        + " ("
+                        + SearchService.SEARCH_MAX_QUERY_STRING_LENGTH.getKey()
+                        + "); actual length: "
+                        + query.length()
+                );
+            }
+        }
         return super.parse(query);
+    }
+
+    /**
+     * Computes the maximum parenthesis nesting depth in the given query string.
+     * This is a pre-parse check to prevent StackOverflowError in Lucene's
+     * recursive-descent classic query parser.
+     */
+    static int maxParenthesisNestingDepth(String query) {
+        int maxDepth = 0;
+        int currentDepth = 0;
+        boolean inQuotes = false;
+        for (int i = 0; i < query.length(); i++) {
+            char c = query.charAt(i);
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (!inQuotes) {
+                if (c == '(') {
+                    currentDepth++;
+                    if (currentDepth > maxDepth) {
+                        maxDepth = currentDepth;
+                    }
+                } else if (c == ')') {
+                    currentDepth--;
+                }
+            }
+        }
+        return maxDepth;
     }
 
     /**
@@ -889,5 +944,21 @@ public class QueryStringQueryParser extends XQueryParser {
      */
     public static void setMaxQueryStringLength(int maxQueryStringLength) {
         QueryStringQueryParser.maxQueryStringLength = maxQueryStringLength;
+    }
+
+    /**
+     * Sets whether the max query string length should be enforced in or not
+     * @param monitorMode if true, the max query string length will not be enforced
+     */
+    public static void setMaxQueryStringLengthMonitorMode(boolean monitorMode) {
+        QueryStringQueryParser.maxQueryStringLengthMonitorMode = monitorMode;
+    }
+
+    /**
+     * Sets the maximum allowed parenthesis nesting depth for query strings.
+     * This should be only called from SearchService on settings updates.
+     */
+    public static void setMaxQueryNestingDepth(int maxQueryNestingDepth) {
+        QueryStringQueryParser.maxQueryNestingDepth = maxQueryNestingDepth;
     }
 }

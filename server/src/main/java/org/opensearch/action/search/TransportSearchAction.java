@@ -32,11 +32,14 @@
 
 package org.opensearch.action.search;
 
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.OriginalIndices;
 import org.opensearch.action.admin.cluster.node.tasks.cancel.CancelTasksRequest;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsGroup;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsRequest;
 import org.opensearch.action.admin.cluster.shards.ClusterSearchShardsResponse;
+import org.opensearch.action.search.pruning.FieldDomainEvaluationContext;
+import org.opensearch.action.search.pruning.SearchIndexPruningResult;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.IndicesOptions;
@@ -56,6 +59,7 @@ import org.opensearch.cluster.routing.ShardIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.unit.TimeValue;
@@ -66,11 +70,14 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.indices.breaker.CircuitBreakerService;
 import org.opensearch.core.tasks.TaskId;
+import org.opensearch.index.fielddomain.ClusterStateFieldDomainProvider;
 import org.opensearch.index.query.Rewriteable;
+import org.opensearch.indices.IndicesService;
 import org.opensearch.search.SearchPhaseResult;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.SearchShardTarget;
@@ -105,6 +112,7 @@ import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.OriginSettingClient;
 import org.opensearch.transport.client.node.NodeClient;
+import org.opensearch.wlm.WorkloadGroupService;
 import org.opensearch.wlm.WorkloadGroupTask;
 
 import java.util.ArrayList;
@@ -181,10 +189,14 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
     private final SearchPipelineService searchPipelineService;
     private final SearchRequestOperationsCompositeListenerFactory searchRequestOperationsCompositeListenerFactory;
     final Tracer tracer;
+    private final IndicesService indicesService;
 
     private final MetricsRegistry metricsRegistry;
 
     private TaskResourceTrackingService taskResourceTrackingService;
+    private final WorkloadGroupService workloadGroupService;
+
+    private final SearchIndexPruningService searchIndexPruningService;
 
     @Inject
     public TransportSearchAction(
@@ -203,7 +215,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         MetricsRegistry metricsRegistry,
         SearchRequestOperationsCompositeListenerFactory searchRequestOperationsCompositeListenerFactory,
         Tracer tracer,
-        TaskResourceTrackingService taskResourceTrackingService
+        TaskResourceTrackingService taskResourceTrackingService,
+        IndicesService indicesService,
+        WorkloadGroupService workloadGroupService
     ) {
         super(SearchAction.NAME, transportService, actionFilters, (Writeable.Reader<SearchRequest>) SearchRequest::new);
         this.client = client;
@@ -226,6 +240,12 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         this.searchRequestOperationsCompositeListenerFactory = searchRequestOperationsCompositeListenerFactory;
         this.tracer = tracer;
         this.taskResourceTrackingService = taskResourceTrackingService;
+        this.indicesService = indicesService;
+        this.searchIndexPruningService = new SearchIndexPruningService(
+            clusterService.getClusterSettings(),
+            new ClusterStateFieldDomainProvider()
+        );
+        this.workloadGroupService = workloadGroupService;
     }
 
     private Map<String, AliasFilter> buildPerIndexAliasFilter(
@@ -314,6 +334,9 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
     @Override
     protected void doExecute(Task task, SearchRequest searchRequest, ActionListener<SearchResponse> listener) {
+        // searchStatusStatsUpdateListener will execute the logic within the original listener but
+        // also track the response status of the searchResponse.
+        ActionListener<SearchResponse> searchStatusStatsUpdateListener;
         // only if task is of type CancellableTask and support cancellation on timeout, treat this request eligible for timeout based
         // cancellation. There may be other top level requests like AsyncSearch which is using SearchRequest internally and has it's own
         // cancellation mechanism. For such cases, the SearchRequest when created can override the createTask and set the
@@ -327,7 +350,21 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 e -> {}
             );
         }
-        executeRequest(task, searchRequest, this::searchAsyncAction, listener);
+        final ActionListener<SearchResponse> finalListner = listener;
+        searchStatusStatsUpdateListener = ActionListener.wrap((searchResponse) -> {
+            try {
+                indicesService.getSearchResponseStatusStats().inc(searchResponse.status());
+            } finally {
+                finalListner.onResponse(searchResponse);
+            }
+        }, (e) -> {
+            try {
+                indicesService.getSearchResponseStatusStats().inc(ExceptionsHelper.status(e));
+            } finally {
+                finalListner.onFailure(e);
+            }
+        });
+        executeRequest(task, searchRequest, this::searchAsyncAction, searchStatusStatsUpdateListener);
     }
 
     /**
@@ -441,7 +478,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         final Span requestSpan = tracer.startSpan(SpanBuilder.from(task, actionName));
         try (final SpanScope spanScope = tracer.withSpanInScope(requestSpan)) {
             SearchRequestOperationsListener.CompositeListener requestOperationsListeners;
-            final ActionListener<SearchResponse> updatedListener = TraceableActionListener.create(originalListener, requestSpan, tracer);
+            ActionListener<SearchResponse> updatedListener = TraceableActionListener.create(originalListener, requestSpan, tracer);
             requestOperationsListeners = searchRequestOperationsCompositeListenerFactory.buildCompositeListener(
                 originalSearchRequest,
                 logger,
@@ -452,18 +489,34 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 originalSearchRequest,
                 taskResourceTrackingService::getTaskResourceUsageFromThreadContext
             );
-            searchRequestContext.getSearchRequestOperationsListener().onRequestStart(searchRequestContext);
 
             // At this point either the QUERY_GROUP_ID header will be present in ThreadContext either via ActionFilter
             // or HTTP header (HTTP header will be deprecated once ActionFilter is implemented)
             if (task instanceof WorkloadGroupTask) {
                 ((WorkloadGroupTask) task).setWorkloadGroupId(threadPool.getThreadContext());
+                // Before onRequestStart, so a rejection doesn't leak the request gauges.
+                try {
+                    Releasable throttlePermit = workloadGroupService.acquireThrottleOrReject(
+                        (WorkloadGroupTask) task,
+                        () -> parentAlreadyCounted(task)
+                    );
+                    if (throttlePermit != null) {
+                        // Release before notifying: a completion listener (e.g. _msearch) may start new work in this bucket.
+                        updatedListener = WorkloadGroupService.releaseThrottlePermitBeforeCompletion(updatedListener, throttlePermit);
+                    }
+                } catch (OpenSearchRejectedExecutionException e) {
+                    updatedListener.onFailure(e);
+                    return;
+                }
             }
+
+            searchRequestContext.getSearchRequestOperationsListener().onRequestStart(searchRequestContext);
 
             PipelinedRequest searchRequest;
             ActionListener<SearchResponse> listener;
             try {
-                searchRequest = searchPipelineService.resolvePipeline(originalSearchRequest, indexNameExpressionResolver);
+                final Task parentTask = extractParentTask(originalSearchRequest);
+                searchRequest = searchPipelineService.resolvePipeline(originalSearchRequest, parentTask, indexNameExpressionResolver);
                 listener = searchRequest.transformResponseListener(updatedListener);
             } catch (Exception e) {
                 updatedListener.onFailure(e);
@@ -485,13 +538,61 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 } else {
                     Rewriteable.rewriteAndFetch(
                         sr.source(),
-                        searchService.getRewriteContext(timeProvider::getAbsoluteStartMillis, searchRequest),
+                        // Parent rewrite searches on this task only when it is counted, so a nested search isn't charged twice.
+                        searchService.getRewriteContext(
+                            timeProvider::getAbsoluteStartMillis,
+                            searchRequest,
+                            isThrottleCounted(task) ? localTaskId(task) : TaskId.EMPTY_TASK_ID
+                        ),
                         rewriteListener
                     );
                 }
             }, listener::onFailure);
-            searchRequest.transformRequest(requestTransformListener);
+            try {
+                searchRequest.transformRequest(requestTransformListener);
+            } catch (Exception e) {
+                // Same listener as the async failure path; it wraps updatedListener, so the permit is still released.
+                listener.onFailure(e);
+            }
         }
+    }
+
+    /**
+     * Whether this request's parent task is already counted against a node-level throttle bucket, so admission charges it
+     * nothing (see {@link WorkloadGroupService#acquireThrottleOrReject(WorkloadGroupTask, BooleanSupplier)}); a nested
+     * coordinator search issued during rewrite would otherwise make the request compete with itself. Only the immediate,
+     * local parent is inspected: the rewrite client is the only thing that parents a counted coordinator search, and it is
+     * wrapped only when that parent was counted, so a counted ancestor is always the immediate parent. Non-search parents
+     * (an {@code _msearch} task, a reindex task) never carry the flag, so their child searches are each charged, as
+     * intended. Remote parents are skipped -- the throttle is per node, and {@code TaskManager#getTask} is node-local.
+     */
+    private boolean parentAlreadyCounted(final Task task) {
+        TaskId parentTaskId = task.getParentTaskId();
+        if (parentTaskId == null || parentTaskId.isSet() == false) {
+            return false;
+        }
+        if (clusterService.localNode().getId().equals(parentTaskId.getNodeId()) == false) {
+            return false;
+        }
+        return isThrottleCounted(taskManager.getTask(parentTaskId.getId()));
+    }
+
+    /** Whether {@code task}'s work is accounted for against a throttle bucket, so a nested search can inherit it. */
+    private static boolean isThrottleCounted(final Task task) {
+        return task instanceof WorkloadGroupTask && ((WorkloadGroupTask) task).isThrottleCounted();
+    }
+
+    /** A {@link TaskId} addressing {@code task} on this node. */
+    private TaskId localTaskId(final Task task) {
+        return new TaskId(clusterService.localNode().getId(), task.getId());
+    }
+
+    private Task extractParentTask(final SearchRequest searchRequest) {
+        TaskId taskId = searchRequest.getParentTask();
+        if (taskId != null && taskId != TaskId.EMPTY_TASK_ID) {
+            return taskManager.getTask(taskId.getId());
+        }
+        return null;
     }
 
     private ActionListener<SearchSourceBuilder> buildRewriteListener(
@@ -1252,6 +1353,68 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         SearchResponse.Clusters clusters,
         SearchRequestContext searchRequestContext
     ) {
+        maybeApplySearchIndexPruning(searchRequest, shardIterators, clusterState, timeProvider);
+        return createSearchAsyncAction(
+            task,
+            searchRequest,
+            executor,
+            shardIterators,
+            timeProvider,
+            connectionLookup,
+            clusterState,
+            aliasFilter,
+            concreteIndexBoosts,
+            indexRoutings,
+            listener,
+            preFilter,
+            threadPool,
+            clusters,
+            searchRequestContext
+        );
+    }
+
+    /**
+     * Applies index pruning results to the request-local shard iterators.
+     */
+    private void maybeApplySearchIndexPruning(
+        SearchRequest searchRequest,
+        GroupShardsIterator<SearchShardIterator> shardIterators,
+        ClusterState clusterState,
+        SearchTimeProvider timeProvider
+    ) {
+        final SearchIndexPruningResult pruningResult = searchIndexPruningService.prune(
+            searchRequest,
+            shardIterators,
+            clusterState,
+            new FieldDomainEvaluationContext(timeProvider::getAbsoluteStartMillis)
+        );
+        if (pruningResult.pruned() == false) {
+            return;
+        }
+        for (int i = 0; i < pruningResult.originalShardGroups(); i++) {
+            if (pruningResult.isPrunedShardGroup(i)) {
+                pruningResult.shardIterators().get(i).resetAndSkip();
+            }
+        }
+    }
+
+    private AbstractSearchAsyncAction<? extends SearchPhaseResult> createSearchAsyncAction(
+        SearchTask task,
+        SearchRequest searchRequest,
+        Executor executor,
+        GroupShardsIterator<SearchShardIterator> shardIterators,
+        SearchTimeProvider timeProvider,
+        BiFunction<String, String, Transport.Connection> connectionLookup,
+        ClusterState clusterState,
+        Map<String, AliasFilter> aliasFilter,
+        Map<String, Float> concreteIndexBoosts,
+        Map<String, Set<String>> indexRoutings,
+        ActionListener<SearchResponse> listener,
+        boolean preFilter,
+        ThreadPool threadPool,
+        SearchResponse.Clusters clusters,
+        SearchRequestContext searchRequestContext
+    ) {
         if (preFilter) {
             return new CanMatchPreFilterSearchPhase(
                 logger,
@@ -1268,7 +1431,7 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                 clusterState,
                 task,
                 (iter) -> new WrappingSearchAsyncActionPhase(
-                    searchAsyncAction(
+                    createSearchAsyncAction(
                         task,
                         searchRequest,
                         executor,

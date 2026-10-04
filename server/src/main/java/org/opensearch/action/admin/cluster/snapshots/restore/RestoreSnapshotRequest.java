@@ -36,6 +36,7 @@ import org.opensearch.Version;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
+import org.opensearch.cluster.metadata.MetadataCreateIndexService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.logging.DeprecationLogger;
@@ -49,6 +50,7 @@ import org.opensearch.core.xcontent.ToXContentObject;
 import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -153,6 +155,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
 
     private AliasWriteIndexPolicy aliasWriteIndexPolicy = AliasWriteIndexPolicy.PRESERVE;
 
+    private boolean attachToDataStream = false;
+
     public RestoreSnapshotRequest() {}
 
     /**
@@ -199,6 +203,9 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
         if (in.getVersion().onOrAfter(Version.V_3_3_0)) {
             aliasWriteIndexPolicy = in.readEnum(AliasWriteIndexPolicy.class);
         }
+        if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
+            attachToDataStream = in.readBoolean();
+        }
     }
 
     @Override
@@ -235,6 +242,9 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
         if (out.getVersion().onOrAfter(Version.V_3_3_0)) {
             out.writeEnum(aliasWriteIndexPolicy);
         }
+        if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
+            out.writeBoolean(attachToDataStream);
+        }
     }
 
     @Override
@@ -257,6 +267,17 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
         }
         if (ignoreIndexSettings == null) {
             validationException = addValidationError("ignoreIndexSettings are missing", validationException);
+        }
+        if (Strings.isNullOrEmpty(renameReplacement) == false
+            && renameReplacement.getBytes(StandardCharsets.UTF_8).length > MetadataCreateIndexService.MAX_INDEX_NAME_BYTES) {
+            validationException = addValidationError(
+                String.format(
+                    Locale.ROOT,
+                    "rename_replacement string size exceeds max allowed size of %s bytes",
+                    MetadataCreateIndexService.MAX_INDEX_NAME_BYTES
+                ),
+                validationException
+            );
         }
         return validationException;
     }
@@ -691,6 +712,26 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
     }
 
     /**
+     * When {@code true}, a restored index whose name matches the data stream backing-index convention
+     * ({@code .ds-<dataStream>-NNNNNN}) is attached to a pre-existing data stream of the same name as part of the
+     * restore. Defaults to {@code false}, in which case such an index is restored as a standalone index.
+     *
+     * @param attachToDataStream whether to attach matching restored indices to their data stream
+     * @return this request
+     */
+    public RestoreSnapshotRequest attachToDataStream(boolean attachToDataStream) {
+        this.attachToDataStream = attachToDataStream;
+        return this;
+    }
+
+    /**
+     * Returns whether matching restored indices are attached to their data stream.
+     */
+    public boolean attachToDataStream() {
+        return attachToDataStream;
+    }
+
+    /**
      * Parses restore definition
      *
      * @param source restore definition
@@ -781,6 +822,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
                 }
             } else if ("alias_write_index_policy".equals(name)) {
                 aliasWriteIndexPolicy(AliasWriteIndexPolicy.fromString((String) entry.getValue()));
+            } else if (name.equals("attach_to_data_stream")) {
+                attachToDataStream(nodeBooleanValue(entry.getValue(), "attach_to_data_stream"));
             } else {
                 if (IndicesOptions.isIndicesOptions(name) == false) {
                     throw new IllegalArgumentException("Unknown parameter " + name);
@@ -839,6 +882,7 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
             builder.field("source_remote_translog_repository", sourceRemoteTranslogRepository);
         }
         builder.field("alias_write_index_policy", aliasWriteIndexPolicy.name().toLowerCase(Locale.ROOT));
+        builder.field("attach_to_data_stream", attachToDataStream);
         builder.endObject();
         return builder;
     }
@@ -871,7 +915,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
             && Objects.equals(storageType, that.storageType)
             && Objects.equals(sourceRemoteStoreRepository, that.sourceRemoteStoreRepository)
             && Objects.equals(sourceRemoteTranslogRepository, that.sourceRemoteTranslogRepository)
-            && aliasWriteIndexPolicy == that.aliasWriteIndexPolicy;
+            && aliasWriteIndexPolicy == that.aliasWriteIndexPolicy
+            && attachToDataStream == that.attachToDataStream;
         return equals;
     }
 
@@ -895,7 +940,8 @@ public class RestoreSnapshotRequest extends ClusterManagerNodeRequest<RestoreSna
             storageType,
             sourceRemoteStoreRepository,
             sourceRemoteTranslogRepository,
-            aliasWriteIndexPolicy
+            aliasWriteIndexPolicy,
+            attachToDataStream
         );
         result = 31 * result + Arrays.hashCode(indices);
         result = 31 * result + Arrays.hashCode(ignoreIndexSettings);

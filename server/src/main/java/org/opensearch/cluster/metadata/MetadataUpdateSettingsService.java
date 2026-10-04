@@ -67,6 +67,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -142,6 +143,7 @@ public class MetadataUpdateSettingsService {
         validateRefreshIntervalSettings(normalizedSettings, clusterService.getClusterSettings());
         validateTranslogDurabilitySettings(normalizedSettings, clusterService.getClusterSettings(), clusterService.getSettings());
         validateIndexTotalPrimaryShardsPerNodeSetting(normalizedSettings, clusterService);
+        validateCryptoStoreSettings(normalizedSettings, request.indices(), clusterService.state());
         final int defaultReplicaCount = clusterService.getClusterSettings().get(Metadata.DEFAULT_REPLICA_COUNT_SETTING);
 
         Settings.Builder settingsForClosedIndices = Settings.builder();
@@ -572,13 +574,11 @@ public class MetadataUpdateSettingsService {
             return;
         }
 
-        // Check if remote store is enabled
-        boolean isRemoteStoreEnabled = clusterService.state()
-            .nodes()
-            .getNodes()
-            .values()
-            .stream()
-            .allMatch(DiscoveryNode::isRemoteStoreNode);
+        // Remote store is enabled only when there is at least one node and every node is a
+        // remote-store node (allMatch is vacuously true on an empty node set, which must not
+        // count as remote-store enabled).
+        Collection<DiscoveryNode> nodes = clusterService.state().nodes().getNodes().values();
+        boolean isRemoteStoreEnabled = !nodes.isEmpty() && nodes.stream().allMatch(DiscoveryNode::isRemoteStoreNode);
         if (!isRemoteStoreEnabled) {
             throw new IllegalArgumentException(
                 "Setting ["
@@ -587,6 +587,35 @@ public class MetadataUpdateSettingsService {
                     + INDEX_TOTAL_REMOTE_CAPABLE_PRIMARY_SHARDS_PER_NODE_SETTING.getKey()
                     + "] can only be used with remote store enabled clusters"
             );
+        }
+    }
+
+    /**
+     * Validates crypto store settings are immutable after index creation.
+     */
+    public static void validateCryptoStoreSettings(Settings indexSettings, Index[] indices, ClusterState clusterState) {
+        final String storeTypeKey = "index.store.type";
+
+        // Only validate if store.type is being explicitly modified
+        if (!indexSettings.keySet().contains(storeTypeKey)) {
+            return;
+        }
+
+        for (Index index : indices) {
+            String currentStoreType = clusterState.metadata().getIndexSafe(index).getSettings().get(storeTypeKey, "");
+            String newStoreType = indexSettings.get(storeTypeKey);
+
+            // Prevent changing FROM cryptofs to anything else (including null)
+            if ("cryptofs".equals(currentStoreType) && !"cryptofs".equals(newStoreType)) {
+                throw new IllegalArgumentException(
+                    "Cannot change store type from 'cryptofs' for index [" + index.getName() + "] - cryptofs store type is immutable"
+                );
+            }
+
+            // Prevent changing TO cryptofs from any other type
+            if (!"cryptofs".equals(currentStoreType) && "cryptofs".equals(newStoreType)) {
+                throw new IllegalArgumentException("Cannot change store type to 'cryptofs' for index [" + index.getName() + "]");
+            }
         }
     }
 }

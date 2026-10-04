@@ -45,6 +45,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.index.store.ParallelDownloadPermits;
 
 import java.util.concurrent.TimeUnit;
 
@@ -153,6 +154,34 @@ public class RecoverySettings {
     );
 
     /**
+     * Size of each byte-range part when a single large segment file is downloaded from the remote store using
+     * multiple parallel range requests. Files no larger than one part are downloaded as a single stream.
+     */
+    public static final Setting<ByteSizeValue> INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_PART_SIZE_SETTING = Setting.byteSizeSetting(
+        "indices.recovery.remote_store.parallel_download.part_size",
+        new ByteSizeValue(16, ByteSizeUnit.MB),
+        new ByteSizeValue(1, ByteSizeUnit.MB),
+        new ByteSizeValue(1, ByteSizeUnit.GB),
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    /**
+     * Node-wide cap on the number of byte-range parts that may be prefetched ahead of the sequential writer across all
+     * concurrent remote store downloads. Each prefetched part holds at most
+     * {@link #INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_PART_SIZE_SETTING} bytes of heap, so the heap used by
+     * parallel part downloads is bounded by {@code max_concurrent_parts * part_size}. Setting this to 0 disables
+     * multi-part downloads and every file is fetched as a single stream.
+     */
+    public static final Setting<Integer> INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_MAX_CONCURRENT_PARTS_SETTING = new Setting<>(
+        "indices.recovery.remote_store.parallel_download.max_concurrent_parts",
+        (s) -> Integer.toString(Math.max(1, OpenSearchExecutors.allocatedProcessors(s) / 2)),
+        (s) -> Setting.parseInt(s, 0, "indices.recovery.remote_store.parallel_download.max_concurrent_parts"),
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    /**
      * how long to wait before retrying after issues cause by cluster state syncing between nodes
      * i.e., local node is not yet known on remote node, remote shard not yet started etc.
      */
@@ -230,6 +259,26 @@ public class RecoverySettings {
         Property.NodeScope
     );
 
+    public static final Setting<Boolean> INDICES_TRANSLOG_CONCURRENT_RECOVERY_ENABLE = Setting.boolSetting(
+        "indices.translog_concurrent_recovery.enable",
+        false,
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
+    // Limiting the maximum value to 1 million is to avoid excessive memory usage of the bitset in LocalCheckpointTracker during
+    // out-of-order execution of concurrent recovery of translog.
+    // Considering the worst-case scenario, with 1000 concurrent recovery tasks, each task recovering 1 million translogs, the bitset
+    // occupancy is approximately 125MB
+    public static final Setting<Integer> INDICES_TRANSLOG_CONCURRENT_RECOVERY_BATCH_SIZE = Setting.intSetting(
+        "indices.translog_concurrent_recovery.batch_size",
+        500000,
+        1000,
+        1000000,
+        Property.Dynamic,
+        Property.NodeScope
+    );
+
     private volatile ByteSizeValue mergedSegmentWarmerMinSegmentSizeThreshold;
     private volatile ByteSizeValue recoveryMaxBytesPerSec;
     private volatile ByteSizeValue replicationMaxBytesPerSec;
@@ -238,6 +287,8 @@ public class RecoverySettings {
     private volatile int maxConcurrentFileChunks;
     private volatile int maxConcurrentOperations;
     private volatile int maxConcurrentRemoteStoreStreams;
+    private volatile ByteSizeValue remoteStoreParallelDownloadPartSize;
+    private final ParallelDownloadPermits remoteStoreParallelDownloadPermits;
     private volatile SimpleRateLimiter recoveryRateLimiter;
     private volatile SimpleRateLimiter replicationRateLimiter;
     private volatile SimpleRateLimiter mergedSegmentReplicationRateLimiter;
@@ -252,11 +303,18 @@ public class RecoverySettings {
     private volatile TimeValue internalRemoteUploadTimeout;
     private volatile TimeValue mergedSegmentReplicationTimeout;
 
+    private volatile boolean isTranslogConcurrentRecoveryEnable;
+    private volatile int translogConcurrentRecoveryBatchSize;
+
     public RecoverySettings(Settings settings, ClusterSettings clusterSettings) {
         this.retryDelayStateSync = INDICES_RECOVERY_RETRY_DELAY_STATE_SYNC_SETTING.get(settings);
         this.maxConcurrentFileChunks = INDICES_RECOVERY_MAX_CONCURRENT_FILE_CHUNKS_SETTING.get(settings);
         this.maxConcurrentOperations = INDICES_RECOVERY_MAX_CONCURRENT_OPERATIONS_SETTING.get(settings);
         this.maxConcurrentRemoteStoreStreams = INDICES_RECOVERY_MAX_CONCURRENT_REMOTE_STORE_STREAMS_SETTING.get(settings);
+        this.remoteStoreParallelDownloadPartSize = INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_PART_SIZE_SETTING.get(settings);
+        this.remoteStoreParallelDownloadPermits = new ParallelDownloadPermits(
+            INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_MAX_CONCURRENT_PARTS_SETTING.get(settings)
+        );
         // doesn't have to be fast as nodes are reconnected every 10s by default (see InternalClusterService.ReconnectToNodes)
         // and we want to give the cluster-manager time to remove a faulty node
         this.retryDelayNetwork = INDICES_RECOVERY_RETRY_DELAY_NETWORK_SETTING.get(settings);
@@ -286,6 +344,9 @@ public class RecoverySettings {
         this.internalRemoteUploadTimeout = INDICES_INTERNAL_REMOTE_UPLOAD_TIMEOUT.get(settings);
         this.chunkSize = INDICES_RECOVERY_CHUNK_SIZE_SETTING.get(settings);
 
+        this.isTranslogConcurrentRecoveryEnable = INDICES_TRANSLOG_CONCURRENT_RECOVERY_ENABLE.get(settings);
+        this.translogConcurrentRecoveryBatchSize = INDICES_TRANSLOG_CONCURRENT_RECOVERY_BATCH_SIZE.get(settings);
+
         clusterSettings.addSettingsUpdateConsumer(INDICES_RECOVERY_MAX_BYTES_PER_SEC_SETTING, this::setRecoveryMaxBytesPerSec);
         clusterSettings.addSettingsUpdateConsumer(INDICES_REPLICATION_MAX_BYTES_PER_SEC_SETTING, this::setReplicationMaxBytesPerSec);
         clusterSettings.addSettingsUpdateConsumer(
@@ -310,6 +371,14 @@ public class RecoverySettings {
             INDICES_RECOVERY_MAX_CONCURRENT_REMOTE_STORE_STREAMS_SETTING,
             this::setMaxConcurrentRemoteStoreStreams
         );
+        clusterSettings.addSettingsUpdateConsumer(
+            INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_PART_SIZE_SETTING,
+            this::setRemoteStoreParallelDownloadPartSize
+        );
+        clusterSettings.addSettingsUpdateConsumer(
+            INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_MAX_CONCURRENT_PARTS_SETTING,
+            remoteStoreParallelDownloadPermits::setMaxPermits
+        );
         clusterSettings.addSettingsUpdateConsumer(INDICES_RECOVERY_RETRY_DELAY_STATE_SYNC_SETTING, this::setRetryDelayStateSync);
         clusterSettings.addSettingsUpdateConsumer(INDICES_RECOVERY_RETRY_DELAY_NETWORK_SETTING, this::setRetryDelayNetwork);
         clusterSettings.addSettingsUpdateConsumer(INDICES_RECOVERY_INTERNAL_ACTION_TIMEOUT_SETTING, this::setInternalActionTimeout);
@@ -323,6 +392,11 @@ public class RecoverySettings {
         clusterSettings.addSettingsUpdateConsumer(
             INDICES_RECOVERY_INTERNAL_ACTION_RETRY_TIMEOUT_SETTING,
             this::setInternalActionRetryTimeout
+        );
+        clusterSettings.addSettingsUpdateConsumer(INDICES_TRANSLOG_CONCURRENT_RECOVERY_ENABLE, this::setTranslogConcurrentRecoveryEnable);
+        clusterSettings.addSettingsUpdateConsumer(
+            INDICES_TRANSLOG_CONCURRENT_RECOVERY_BATCH_SIZE,
+            this::setTranslogConcurrentRecoveryBatchSize
         );
     }
 
@@ -485,6 +559,22 @@ public class RecoverySettings {
         this.maxConcurrentRemoteStoreStreams = maxConcurrentRemoteStoreStreams;
     }
 
+    public ByteSizeValue getRemoteStoreParallelDownloadPartSize() {
+        return remoteStoreParallelDownloadPartSize;
+    }
+
+    private void setRemoteStoreParallelDownloadPartSize(ByteSizeValue partSize) {
+        this.remoteStoreParallelDownloadPartSize = partSize;
+    }
+
+    /**
+     * Node-wide budget of prefetched parts shared by all remote store downloads on this node.
+     * A budget of zero disables multi-part parallel downloads.
+     */
+    public ParallelDownloadPermits getRemoteStoreParallelDownloadPermits() {
+        return remoteStoreParallelDownloadPermits;
+    }
+
     public boolean isMergedSegmentReplicationWarmerEnabled() {
         return mergedSegmentReplicationWarmerEnabled;
     }
@@ -493,4 +583,19 @@ public class RecoverySettings {
         this.mergedSegmentReplicationWarmerEnabled = mergedSegmentReplicationWarmerEnabled;
     }
 
+    public boolean isTranslogConcurrentRecoveryEnable() {
+        return isTranslogConcurrentRecoveryEnable;
+    }
+
+    private void setTranslogConcurrentRecoveryEnable(boolean translogConcurrentRecoveryEnable) {
+        isTranslogConcurrentRecoveryEnable = translogConcurrentRecoveryEnable;
+    }
+
+    public int getTranslogConcurrentRecoveryBatchSize() {
+        return translogConcurrentRecoveryBatchSize;
+    }
+
+    private void setTranslogConcurrentRecoveryBatchSize(int translogConcurrentRecoveryBatchSize) {
+        this.translogConcurrentRecoveryBatchSize = translogConcurrentRecoveryBatchSize;
+    }
 }

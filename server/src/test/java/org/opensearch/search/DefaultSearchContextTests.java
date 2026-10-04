@@ -35,12 +35,16 @@ package org.opensearch.search;
 import com.carrotsearch.randomizedtesting.annotations.ParametersFactory;
 
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryCachingPolicy;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
+import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.opensearch.Version;
@@ -70,6 +74,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.query.AbstractQueryBuilder;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.ParsedQuery;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.search.aggregations.AggregatorFactories;
@@ -110,6 +115,7 @@ import java.util.function.Supplier;
 
 import static org.opensearch.index.IndexSettings.INDEX_SEARCH_THROTTLED;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
@@ -397,6 +403,20 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
             ParsedQuery parsedQuery = ParsedQuery.parsedMatchAllQuery();
             context3.sliceBuilder(null).parsedQuery(parsedQuery).preProcess(false);
             assertEquals(context3.query(), context3.buildFilteredQuery(parsedQuery.query()));
+
+            // buildFilteredQuery: when at least one filter is added (here a slice filter) and the incoming
+            // query is already a ConstantScoreQuery, the combined query must stay non-scoring so Lucene's
+            // COMPLETE_NO_SCORES fast path is preserved; a normal query is combined into a scoring BooleanQuery.
+            when(mapperService.hasNested()).thenReturn(false);
+            SliceBuilder filterSlice = mock(SliceBuilder.class);
+            when(filterSlice.toFilter(any(), any(), any(), any())).thenReturn(new TermQuery(new Term("field", "value")));
+            context3.sliceBuilder(filterSlice);
+            assertThat(
+                context3.buildFilteredQuery(new ConstantScoreQuery(new TermQuery(new Term("content", "alpha")))),
+                instanceOf(ConstantScoreQuery.class)
+            );
+            assertThat(context3.buildFilteredQuery(new TermQuery(new Term("content", "alpha"))), instanceOf(BooleanQuery.class));
+            context3.sliceBuilder(null);
             // make sure getPreciseRelativeTimeInMillis is same as System.nanoTime()
             long timeToleranceInMs = 10;
             long currTime = TimeValue.nsecToMSec(System.nanoTime());
@@ -894,6 +914,7 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
             final ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
             clusterSettings.registerSetting(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_SETTING);
             clusterSettings.registerSetting(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE);
+            clusterSettings.registerSetting(SearchService.CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY);
             clusterSettings.applySettings(
                 Settings.builder().put(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE.getKey(), "auto").build()
             );
@@ -1167,6 +1188,105 @@ public class DefaultSearchContextTests extends OpenSearchTestCase {
                 assertFalse(context.shouldUseConcurrentSearch());
             }
             assertThrows(SetOnce.AlreadySetException.class, context::evaluateRequestShouldUseConcurrentSearch);
+
+            // Case8: no aggregations, query supports intra-segment search, partition strategy is balanced (default)
+            // should use concurrent search via intra-segment search path
+            when(decider1.getConcurrentSearchDecision()).thenReturn(
+                new ConcurrentSearchDecision(ConcurrentSearchDecision.DecisionStatus.NO_OP, "noop")
+            );
+            when(decider2.getConcurrentSearchDecision()).thenReturn(
+                new ConcurrentSearchDecision(ConcurrentSearchDecision.DecisionStatus.NO_OP, "noop")
+            );
+
+            SearchSourceBuilder intraSegmentSourceBuilder = new SearchSourceBuilder();
+            QueryBuilder intraSegmentQuery = mock(QueryBuilder.class);
+            when(intraSegmentQuery.supportsIntraSegmentSearch()).thenReturn(true);
+            intraSegmentSourceBuilder.query(intraSegmentQuery);
+            when(shardSearchRequest.source()).thenReturn(intraSegmentSourceBuilder);
+
+            // Apply balanced partition strategy
+            clusterSettings.applySettings(
+                Settings.builder()
+                    .put(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE.getKey(), "auto")
+                    .put(SearchService.CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY.getKey(), "balanced")
+                    .build()
+            );
+
+            context = new DefaultSearchContext(
+                readerContext,
+                shardSearchRequest,
+                target,
+                clusterService,
+                bigArrays,
+                null,
+                null,
+                null,
+                false,
+                Version.CURRENT,
+                false,
+                executor,
+                null,
+                concurrentSearchRequestDeciders
+            );
+            // No aggregations set
+            context.evaluateRequestShouldUseConcurrentSearch();
+            if (executor == null) {
+                assertFalse(context.shouldUseConcurrentSearch());
+            } else {
+                assertTrue(context.shouldUseConcurrentSearch());
+            }
+
+            // Case9: no aggregations, query does NOT support intra-segment search
+            // should NOT use concurrent search
+            when(intraSegmentQuery.supportsIntraSegmentSearch()).thenReturn(false);
+
+            context = new DefaultSearchContext(
+                readerContext,
+                shardSearchRequest,
+                target,
+                clusterService,
+                bigArrays,
+                null,
+                null,
+                null,
+                false,
+                Version.CURRENT,
+                false,
+                executor,
+                null,
+                concurrentSearchRequestDeciders
+            );
+            context.evaluateRequestShouldUseConcurrentSearch();
+            assertFalse(context.shouldUseConcurrentSearch());
+
+            // Case10: query supports intra-segment search with partition strategy as none
+            // should NOT use concurrent search
+            when(intraSegmentQuery.supportsIntraSegmentSearch()).thenReturn(true);
+            clusterSettings.applySettings(
+                Settings.builder()
+                    .put(SearchService.CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE.getKey(), "auto")
+                    .put(SearchService.CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY.getKey(), "segment")
+                    .build()
+            );
+
+            context = new DefaultSearchContext(
+                readerContext,
+                shardSearchRequest,
+                target,
+                clusterService,
+                bigArrays,
+                null,
+                null,
+                null,
+                false,
+                Version.CURRENT,
+                false,
+                executor,
+                null,
+                concurrentSearchRequestDeciders
+            );
+            context.evaluateRequestShouldUseConcurrentSearch();
+            assertFalse(context.shouldUseConcurrentSearch());
 
             // shutdown the threadpool
             threadPool.shutdown();

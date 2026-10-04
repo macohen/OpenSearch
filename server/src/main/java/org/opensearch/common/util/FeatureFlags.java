@@ -74,6 +74,17 @@ public class FeatureFlags {
         Property.NodeScope
     );
 
+    /**
+     * Gates the functionality of pluggable dataformat feature.
+     */
+    public static final String PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG = FEATURE_FLAG_PREFIX + "pluggable.dataformat.enabled";
+
+    public static final Setting<Boolean> PLUGGABLE_DATAFORMAT_EXPERIMENTAL_SETTING = Setting.boolSetting(
+        PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG,
+        false,
+        Property.NodeScope
+    );
+
     public static final Setting<Boolean> CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING = Setting.boolSetting(
         CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_FLAG,
         false,
@@ -116,8 +127,24 @@ public class FeatureFlags {
     public static final String STREAM_TRANSPORT = FEATURE_FLAG_PREFIX + "transport.stream.enabled";
     public static final Setting<Boolean> STREAM_TRANSPORT_SETTING = Setting.boolSetting(STREAM_TRANSPORT, false, Property.NodeScope);
 
-    public static final String ARROW_STREAMS = FEATURE_FLAG_PREFIX + "arrow.streams.enabled";
-    public static final Setting<Boolean> ARROW_STREAMS_SETTING = Setting.boolSetting(ARROW_STREAMS, false, Property.NodeScope);
+    /**
+     * Gates strict snapshot version parsing. When enabled, reading snapshot metadata whose stored
+     * version_id is unsupported (e.g. a legacy Elasticsearch snapshot) fails instead of resolving the
+     * version to unknown. Disabled by default so snapshot listing tolerates such repositories.
+     */
+    public static final String SNAPSHOT_STRICT_VERSION_PARSING = FEATURE_FLAG_PREFIX + "snapshot.strict_version_parsing.enabled";
+    public static final Setting<Boolean> SNAPSHOT_STRICT_VERSION_PARSING_SETTING = Setting.boolSetting(
+        SNAPSHOT_STRICT_VERSION_PARSING,
+        false,
+        Property.NodeScope
+    );
+
+    /**
+     * Gates the snapshot resilience optimizations (timeout budgets, circuit breaker, retry foundation).
+     * Default off for the first minor, flipped on in the next, removed one minor later.
+     */
+    public static final String SNAPSHOT_RESILIENCE = FEATURE_FLAG_PREFIX + "snapshot_resilience.enabled";
+    public static final Setting<Boolean> SNAPSHOT_RESILIENCE_SETTING = Setting.boolSetting(SNAPSHOT_RESILIENCE, false, Property.NodeScope);
 
     /**
      * Underlying implementation for feature flags.
@@ -142,9 +169,11 @@ public class FeatureFlags {
                     APPLICATION_BASED_CONFIGURATION_TEMPLATES_SETTING.getDefault(Settings.EMPTY)
                 );
                 put(TERM_VERSION_PRECOMMIT_ENABLE_SETTING, TERM_VERSION_PRECOMMIT_ENABLE_SETTING.getDefault(Settings.EMPTY));
-                put(ARROW_STREAMS_SETTING, ARROW_STREAMS_SETTING.getDefault(Settings.EMPTY));
                 put(STREAM_TRANSPORT_SETTING, STREAM_TRANSPORT_SETTING.getDefault(Settings.EMPTY));
                 put(CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING, CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING.getDefault(Settings.EMPTY));
+                put(PLUGGABLE_DATAFORMAT_EXPERIMENTAL_SETTING, PLUGGABLE_DATAFORMAT_EXPERIMENTAL_SETTING.getDefault(Settings.EMPTY));
+                put(SNAPSHOT_STRICT_VERSION_PARSING_SETTING, SNAPSHOT_STRICT_VERSION_PARSING_SETTING.getDefault(Settings.EMPTY));
+                put(SNAPSHOT_RESILIENCE_SETTING, SNAPSHOT_RESILIENCE_SETTING.getDefault(Settings.EMPTY));
             }
         };
 

@@ -83,6 +83,19 @@ public class RecoverySettingsDynamicUpdateTests extends OpenSearchTestCase {
         assertEquals(80, (int) recoverySettings.replicationRateLimiter().getMBPerSec());
     }
 
+    public void testSetTranslogConcurrentRecoverySettings() {
+        assertFalse(recoverySettings.isTranslogConcurrentRecoveryEnable());
+        assertEquals(500000, recoverySettings.getTranslogConcurrentRecoveryBatchSize());
+        clusterSettings.applySettings(
+            Settings.builder()
+                .put(RecoverySettings.INDICES_TRANSLOG_CONCURRENT_RECOVERY_BATCH_SIZE.getKey(), 700000)
+                .put(RecoverySettings.INDICES_TRANSLOG_CONCURRENT_RECOVERY_ENABLE.getKey(), true)
+                .build()
+        );
+        assertTrue(recoverySettings.isTranslogConcurrentRecoveryEnable());
+        assertEquals(700000, recoverySettings.getTranslogConcurrentRecoveryBatchSize());
+    }
+
     public void testSetMergedSegmentReplicationMaxBytesPerSec() {
         assertEquals(40, (int) recoverySettings.mergedSegmentReplicationRateLimiter().getMBPerSec());
         clusterSettings.applySettings(
@@ -174,6 +187,56 @@ public class RecoverySettingsDynamicUpdateTests extends OpenSearchTestCase {
             Settings.builder().put(RecoverySettings.INDICES_RECOVERY_CHUNK_SIZE_SETTING.getKey(), chunkSize).build()
         );
         assertEquals(chunkSize, recoverySettings.getChunkSize());
+    }
+
+    public void testRemoteStoreParallelDownloadPartSize() {
+        assertEquals(new ByteSizeValue(16, ByteSizeUnit.MB), recoverySettings.getRemoteStoreParallelDownloadPartSize());
+        ByteSizeValue partSize = new ByteSizeValue(between(1, 1024), ByteSizeUnit.MB);
+        clusterSettings.applySettings(
+            Settings.builder()
+                .put(RecoverySettings.INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_PART_SIZE_SETTING.getKey(), partSize)
+                .build()
+        );
+        assertEquals(partSize, recoverySettings.getRemoteStoreParallelDownloadPartSize());
+
+        // below the 1mb floor
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> clusterSettings.applySettings(
+                Settings.builder()
+                    .put(
+                        RecoverySettings.INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_PART_SIZE_SETTING.getKey(),
+                        new ByteSizeValue(512, ByteSizeUnit.KB)
+                    )
+                    .build()
+            )
+        );
+    }
+
+    public void testRemoteStoreParallelDownloadMaxConcurrentParts() {
+        final int initial = recoverySettings.getRemoteStoreParallelDownloadPermits().getMaxPermits();
+        assertEquals(
+            RecoverySettings.INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_MAX_CONCURRENT_PARTS_SETTING.get(Settings.EMPTY).intValue(),
+            initial
+        );
+
+        int maxParts = between(0, 64);
+        clusterSettings.applySettings(
+            Settings.builder()
+                .put(RecoverySettings.INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_MAX_CONCURRENT_PARTS_SETTING.getKey(), maxParts)
+                .build()
+        );
+        // The budget object is shared with in-flight downloads, so it must be resized in place rather than replaced.
+        assertEquals(maxParts, recoverySettings.getRemoteStoreParallelDownloadPermits().getMaxPermits());
+
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> clusterSettings.applySettings(
+                Settings.builder()
+                    .put(RecoverySettings.INDICES_RECOVERY_REMOTE_STORE_PARALLEL_DOWNLOAD_MAX_CONCURRENT_PARTS_SETTING.getKey(), -1)
+                    .build()
+            )
+        );
     }
 
     public void testInternalActionRetryTimeout() {

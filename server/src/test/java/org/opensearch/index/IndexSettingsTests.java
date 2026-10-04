@@ -42,6 +42,7 @@ import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.settings.SettingsException;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.replication.common.ReplicationType;
@@ -58,6 +59,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
+import static org.opensearch.index.IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE;
+import static org.opensearch.index.IndexSettings.INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.core.StringContains.containsString;
 import static org.hamcrest.object.HasToString.hasToString;
@@ -591,6 +594,69 @@ public class IndexSettingsTests extends OpenSearchTestCase {
         assertEquals(actualNewTranslogFlushThresholdSize, settings.getFlushThresholdSize());
     }
 
+    /**
+     * Verifies the index scoped {@code index.remote_store.flush_on_uncommitted_segments.threshold_size}: it has a
+     * default, reports whether the index set it explicitly (which is what makes it win over the cluster default at the
+     * publication site), and rejects zero or negative sizes since those would flush on every successful segments sync.
+     * The precedence against the cluster setting is exercised in {@code RemoteStoreRefreshListenerTests}, which owns
+     * the resolution.
+     */
+    public void testFlushOnUncommittedSegmentsThresholdSize() {
+        IndexSettings settings = new IndexSettings(
+            newIndexMeta("index", Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).build()),
+            Settings.EMPTY
+        );
+        assertEquals(
+            IndexSettings.DEFAULT_FLUSH_ON_UNCOMMITTED_SEGMENTS_THRESHOLD_SIZE,
+            settings.getFlushOnUncommittedSegmentsThresholdSize()
+        );
+        assertFalse(settings.isFlushOnUncommittedSegmentsThresholdSizeExplicit());
+
+        settings.updateIndexMetadata(
+            newIndexMeta(
+                "index",
+                Settings.builder()
+                    .put(IndexSettings.INDEX_REMOTE_STORE_FLUSH_ON_UNCOMMITTED_SEGMENTS_THRESHOLD_SIZE_SETTING.getKey(), "64mb")
+                    .build()
+            )
+        );
+        assertEquals(new ByteSizeValue(64, ByteSizeUnit.MB), settings.getFlushOnUncommittedSegmentsThresholdSize());
+        assertTrue(settings.isFlushOnUncommittedSegmentsThresholdSizeExplicit());
+
+        // removing it puts the index back on the cluster default, which the publication site resolves
+        settings.updateIndexMetadata(newIndexMeta("index", Settings.EMPTY));
+        assertFalse(settings.isFlushOnUncommittedSegmentsThresholdSizeExplicit());
+
+        for (String invalid : new String[] { "0b", "-1" }) {
+            IllegalArgumentException e = expectThrows(
+                IllegalArgumentException.class,
+                () -> new IndexSettings(
+                    newIndexMeta(
+                        "index",
+                        Settings.builder()
+                            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                            .put(IndexSettings.INDEX_REMOTE_STORE_FLUSH_ON_UNCOMMITTED_SEGMENTS_THRESHOLD_SIZE_SETTING.getKey(), invalid)
+                            .build()
+                    ),
+                    Settings.EMPTY
+                )
+            );
+            assertTrue(e.getMessage(), e.getMessage().contains("failed to parse value [" + invalid + "]"));
+        }
+    }
+
+    /** Enablement is cluster-only: there is deliberately no index scoped counterpart, so index scope rejects the key. */
+    public void testFlushOnUncommittedSegmentsEnabledHasNoIndexScopedSetting() {
+        SettingsException e = expectThrows(
+            SettingsException.class,
+            () -> IndexScopedSettings.DEFAULT_SCOPED_SETTINGS.validate(
+                Settings.builder().put("index.remote_store.flush_on_uncommitted_segments.enabled", false).build(),
+                false
+            )
+        );
+        assertTrue(e.getMessage(), e.getMessage().contains("unknown setting [index.remote_store.flush_on_uncommitted_segments.enabled]"));
+    }
+
     public void testTranslogGenerationSizeThreshold() {
         final ByteSizeValue size = new ByteSizeValue(Math.abs(randomInt()));
         final String key = IndexSettings.INDEX_TRANSLOG_GENERATION_THRESHOLD_SIZE_SETTING.getKey();
@@ -884,6 +950,30 @@ public class IndexSettingsTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * index.remote_store.auto_restore.enabled requires fencing: the trigger fires on the cluster manager's view of
+     * node membership while the departed primary may still be alive, and only the fence stops it acknowledging
+     * writes the restored copy will never see.
+     */
+    public void testRemoteStoreAutoRestoreRequiresFencing() {
+        Settings withoutFencing = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_REMOTE_STORE_AUTO_RESTORE_ENABLED, true)
+            .build();
+        IllegalArgumentException iae = expectThrows(
+            IllegalArgumentException.class,
+            () -> IndexScopedSettings.DEFAULT_SCOPED_SETTINGS.validate(withoutFencing, true)
+        );
+        assertTrue(iae.getMessage(), iae.getMessage().contains("can only be enabled when"));
+
+        Settings withFencing = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_REMOTE_STORE_FENCING_ENABLED, true)
+            .put(IndexMetadata.SETTING_REMOTE_STORE_AUTO_RESTORE_ENABLED, true)
+            .build();
+        IndexScopedSettings.DEFAULT_SCOPED_SETTINGS.validate(withFencing, true); // must not throw
+    }
+
     public void testRemoteTranslogRepoDefaultSetting() {
         IndexMetadata metadata = newIndexMeta(
             "index",
@@ -1172,5 +1262,37 @@ public class IndexSettingsTests extends OpenSearchTestCase {
             )
         );
         assertEquals(TimeValue.MINUS_ONE, settings.getPeriodicFlushInterval());
+    }
+
+    public void testPartitionStrategyDefault() {
+        IndexMetadata metadata = newIndexMeta("index", Settings.builder().build());
+        IndexSettings settings = newIndexSettings(metadata, Settings.EMPTY);
+        assertEquals("segment", INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY.get(settings.getSettings()));
+    }
+
+    public void testPartitionStrategyValidValues() {
+        for (String strategy : new String[] { "segment", "balanced", "force" }) {
+            IndexMetadata metadata = newIndexMeta(
+                "index",
+                Settings.builder().put(INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY.getKey(), strategy).build()
+            );
+            IndexSettings settings = newIndexSettings(metadata, Settings.EMPTY);
+            assertEquals(strategy, INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_STRATEGY.get(settings.getSettings()));
+        }
+    }
+
+    public void testPartitionMinSegmentSizeDefault() {
+        IndexMetadata metadata = newIndexMeta("index", Settings.builder().build());
+        IndexSettings settings = newIndexSettings(metadata, Settings.EMPTY);
+        assertEquals(500_000, (int) INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE.get(settings.getSettings()));
+    }
+
+    public void testPartitionMinSegmentSizeCustom() {
+        IndexMetadata metadata = newIndexMeta(
+            "index",
+            Settings.builder().put(INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE.getKey(), 100_000).build()
+        );
+        IndexSettings settings = newIndexSettings(metadata, Settings.EMPTY);
+        assertEquals(100_000, (int) INDEX_CONCURRENT_SEGMENT_SEARCH_PARTITION_MIN_SEGMENT_SIZE.get(settings.getSettings()));
     }
 }
